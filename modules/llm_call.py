@@ -141,7 +141,7 @@ Jika ada produk yang punya tulisan "- I" atau "- O", utamakan "- I" dahulu.
 class AgentRetriever:
     def __init__(
             self, 
-            gemini_api_key="AIzaSyCqytJHKzR-nWZPJNXG0bZ6SMh_3DFtGJE", 
+            gemini_api_key="GEMINI_API_KEY", 
             product_metadata=None,
             combo_metadata=None,
             product_db=None,
