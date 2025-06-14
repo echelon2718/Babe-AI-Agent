@@ -1,21 +1,21 @@
 import pandas as pd
 import json
+import os
 import pika
-
-from modules.llm_call_full import AgentBabe
+from dotenv import load_dotenv
+from modules.llm_call import AgentBabe
+import google.generativeai as genai
 pd.options.mode.chained_assignment = None  # default='warn'
 
-# Open token_cache.json to get the access token
-with open("token_cache.json", "r") as file:
-    token_data = json.load(file)
-
-access_token = token_data.get("access_token", "")
+load_dotenv()
+genai_api_key = os.getenv("GOOGLE_GENAI_API_KEY")
+genai.configure(api_key=genai_api_key)
 
 # === Konfigurasi koneksi RabbitMQ ===
 agent = AgentBabe(df_combo_dir='./product_combos.csv', df_product_dir='./product_items.csv', top_k_retrieve=15)
 credentials = pika.PlainCredentials('guest', 'guest')
 parameters = pika.ConnectionParameters(
-    host='10.15.40.194',
+    host='31.97.106.30',
     port=5679,
     credentials=credentials
 )
@@ -30,7 +30,7 @@ channel.queue_declare(queue='whatsapp_message_queue', durable=True)
 
 # === Fungsi untuk membalas pesan ===
 def send_reply(from_number, to_number, order_body):
-    response_message = f"{agent.handle_order(order_body, access_token)}"
+    response_message = response_message = agent.handle_order(order_body, access_token_dir="./token_cache.json")
 
     payload = {
         "command": "send_message",
@@ -68,12 +68,19 @@ def callback(ch, method, properties, body):
         print(f"❌ Error saat proses pesan: {e}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-# === Jalankan listener ===
-channel.basic_consume(
-    queue='whatsapp_hook_queue',
-    on_message_callback=callback,
-    auto_ack=False
-)
+if __name__ == "__main__":
+    try:
+        # === Jalankan listener ===
+        channel.basic_consume(
+            queue='whatsapp_hook_queue',
+            on_message_callback=callback,
+            auto_ack=False
+        )
 
-print("🔄 Menunggu pesan dari 'whatsapp_hook_queue'...")
-channel.start_consuming()
+        print("🔄 Menunggu pesan dari 'whatsapp_hook_queue'...")
+        channel.start_consuming()
+    except KeyboardInterrupt:
+        print("🔴 Proses dihentikan oleh pengguna.")
+    finally:
+        connection.close()
+        print("🔌 Koneksi RabbitMQ ditutup.")
