@@ -9,8 +9,6 @@ import json
 import pandas as pd
 import ast
 
-genai.configure(api_key="YOUR_GEMINI_API_KEY")
-
 reconfirm_translator_prompt = '''
 Kamu adalah AI Agent untuk Kulkas Babe (@kulkasbabe.id), sebuah brand retail alkohol yang fokus pada delivery order.
 
@@ -141,7 +139,7 @@ Jika ada produk yang punya tulisan "- I" atau "- O", utamakan "- I" dahulu.
 class AgentRetriever:
     def __init__(
             self, 
-            gemini_api_key="GEMINI_API_KEY", 
+            gemini_api_key="AIzaSyCqytJHKzR-nWZPJNXG0bZ6SMh_3DFtGJE", 
             product_metadata=None,
             combo_metadata=None,
             product_db=None,
@@ -187,7 +185,7 @@ class AgentRetriever:
             system_instruction=data_retriever_prompt,
         )
 
-        gemini_ans = model.generate_content(f"{hasil_clean}")
+        gemini_ans = model.generate_content(f"query: {query}, data: {hasil_clean}")
         try:
             gemini_ans = int(gemini_ans.text)
             return gemini_ans
@@ -208,6 +206,7 @@ class AgentRetriever:
 
     def run(self, query):
         reconfirm_json = self.reconfirm_translator(query)
+        # print(reconfirm_json)
         print("PESANAN RECONFIRM")
         print("Nama Pelanggan:", reconfirm_json['cust_name'])
         print("Nomor Telepon:", reconfirm_json['phone_num'])
