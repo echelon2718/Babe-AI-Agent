@@ -9,9 +9,13 @@ import requests
 import ast
 from modules.crud_utility import add_prod_to_order, update_payment, fetch_product_combo_details, fetch_order_details, update_order_detail, cek_kastamer, create_order, list_payment_modes, update_status, cetak_struk, fetch_product_item_details, update_order_attr
 from datetime import datetime, timedelta
+import logging
+from typing import Optional, Tuple, Dict, Any
 
 nltk.download('punkt')
 nltk.download('punkt_tab')
+
+logger = logging.getLogger(__name__)
 
 payment_dict = {
     "Cash": 0,
@@ -39,7 +43,7 @@ Pengiriman: FD (Tidak wajib, default "SD", jika tidak disebutkan)
 
 Jika ada permintaan untuk melakukan voiding seperti, "batalkan struk <ID>", "void struk <ID>", atau "batalkan order <ID>", maka kembalikan pesan dengan format:
 {
-    "pembatalan": "<ID>"
+    "pembatalan": "<list ID>"
 }
 
 Tapi pastikan ada IDnya, jika tidak ada ID, kembalikan pesan dengan format:
@@ -397,41 +401,315 @@ class AgentBabe:
 
         return sanitized_response
 
+    def _process_item(
+        self,
+        order_id: str,
+        nama_produk: str,
+        qty: int,
+        access_token: str,
+    ):
+        df = self.product_df[self.product_df['pos_hidden'] == 0]
+        idx = self.select_id_by_agent(nama_produk, df, self.instructions['item_selection_prompt'], id_col='id', evaluation_col='name')
+        if idx is None:
+            logger.error("Gagal menemukan produk item: %s", nama_produk)
+            return False
+
+        df_sel = df[df['id'] == idx].reset_index(drop=True)
+
+        if df_sel.at[0, 'variants'] != '[]':
+            try:
+                variants = ast.literal_eval(df_sel.at[0, 'variants'])
+                variants_df = pd.DataFrame(variants)
+            except Exception as e:
+                logger.error("Gagal parse variants untuk produk %s: %s", idx, e)
+                return False
+            variants_ready = variants_df[variants_df['stock_qty'] > 0]
+            for prefix in ['L', 'P', 'C']:
+                sel = variants_ready[variants_ready['name'].str.startswith(prefix)]
+                if not sel.empty:
+                    variant_id = sel['id'].iloc[0]
+                    idx = f"{idx}|{variant_id}"
+                    logger.debug("Varian dipilih untuk item %s: %s", nama_produk, idx)
+                    break
+        
+        # Tambah ke order
+        try:
+            resp = add_prod_to_order(order_id, idx, qty, access_token=access_token)
+            # Cek apakah ada key error
+            if resp.get('error'):
+                logger.error("Error saat menambahkan item ke order: %s", resp['error']['message'])
+                return False, resp['error']['message']
+            # Kalau perlu cek resp.status_code atau resp.json untuk deteksi error
+            logger.debug("Response add_prod_to_order: %s", getattr(resp, 'text', ''))
+            print(f"ITEM  {df_sel['name'].iloc[0]:<45} {idx:<15} {qty:<15}")
+            return True, "Item berhasil ditambahkan ke order."
+        except requests.exceptions.HTTPError as http_err:
+            logger.error("HTTPError add item: %s", http_err)
+            return False, "Ada kesalahan HTTP saat memasukkan item ke order."
+        except Exception as e:
+            logger.error("Error lain add item: %s", e)
+            return False, f"Ada kesalahan saat memasukkan item ke order. Error: {e}"
+    
+    def _process_paket(self, order_id: Any, nama_paket: str, qty_pesan: int, access_token: str) -> Any:
+        """
+        Proses paket: cari ID paket, fetch detail, tambahkan tiap item dalam paket,
+        lalu update diskon tiap item. 
+        Mengembalikan True jika sukses, atau string pesan error jika gagal.
+        """
+        # Filter combo yang tidak hidden
+        df = self.combo_df[self.combo_df['pos_hidden'] == 0]
+        task_instruction = self.instructions['combo_selection_prompt']
+        lower = nama_paket.strip().lower()
+
+        # Sesuaikan filter berdasarkan pola nama
+        if lower.startswith(('merch', 'mer')):
+            mask = df['name'].str.lower().str.contains('merch|merh')
+            df = df[mask]
+            task_instruction = self.instructions['merch_selection_prompt']
+        elif lower.startswith(('babe garansiin','garansi','garan')):
+            df = df[df['name'] == 'Babe Garansi-in !!!']
+            task_instruction = self.instructions['garansi_selection_prompt']
+        elif 'kupon' in lower:
+            df = df[df['name'].str.lower().str.contains('kupon')]
+            task_instruction = self.instructions['kupon_selection_prompt']
+        elif 'voucher' in lower:
+            df = df[df['name'].str.lower().str.contains('voucher')]
+            task_instruction = self.instructions['voucher_selection_prompt']
+        elif lower.startswith(('komplimen','komp')):
+            df = df[df['name'].str.lower().str.startswith(('komplimen','komp'))]
+            task_instruction = self.instructions['komplimen_selection_prompt']
+        elif 'delivery' in lower:
+            df = df[df['name'].str.lower().str.contains('delivery')]
+            task_instruction = self.instructions['delivery_selection_prompt']
+        elif lower.startswith('hadiah'):
+            df = df[df['name'].str.lower().str.startswith('hadiah')]
+            task_instruction = self.instructions['hadiah_selection_prompt']
+
+        if df.empty:
+            logger.error("Tidak ada paket matching untuk: %s", nama_paket)
+            return f"Gagal menemukan paket: {nama_paket}"
+        if len(df) == 1:
+            paket_id = df['id'].iloc[0]
+        else:
+            paket_id = self.select_id_by_agent(nama_paket, df, task_instruction, id_col='id', evaluation_col='name')
+        if paket_id is None:
+            logger.error("select_id_by_agent gagal untuk paket: %s", nama_paket)
+            return f"Gagal menemukan paket: {nama_paket}"
+
+        # Ambil detail paket
+        try:
+            combo_details = fetch_product_combo_details(paket_id, access_token)
+            combo_items = combo_details['data']['items']['data']
+        except Exception as e:
+            logger.error("Gagal fetch combo details untuk %s: %s", paket_id, e)
+            return "Gagal ambil detail paket."
+
+        total_harga_normal = 0.0
+        # Tambah tiap item
+        for item in combo_items:
+            product_id = item.get('product_id')
+            var_id = item.get('product_variant_id')
+            qty_total = item.get('qty', 0) * qty_pesan
+            # Fetch detail item untuk cek stok & harga
+            try:
+                item_details = fetch_product_item_details(product_id, access_token=access_token)
+                data = item_details.get('data', {})
+            except Exception as e:
+                logger.error("Gagal fetch item_details ID %s: %s", product_id, e)
+                return f"Gagal ambil data produk {product_id}."
+            # Cek variant dan harga
+            if not data.get('variant'):
+                idx = f"{product_id}"
+                harga = float(data.get('sell_price_pos', 0))
+            else:
+                variants = data.get('variant', [])
+                item_df = pd.DataFrame(variants)
+                harga = float(item_df['sell_price_pos'].iloc[0]) if not item_df.empty else 0.0
+                if 'stock_qty' not in item_df.columns:
+                    logger.error("Data stok tidak ada untuk produk %s", product_id)
+                    return f"Data stok tidak ditemukan untuk {item.get('product_name')}."
+                variants_ready = item_df[item_df['stock_qty'] >= qty_total]
+                if variants_ready.empty:
+                    logger.error("Stok tidak cukup untuk produk %s", product_id)
+                    return f"Maaf, stok tidak cukup untuk {item.get('product_name')}."
+                # Pilih varian: prioritas P, L, C, X
+                chosen_variant_id = None
+                if var_id is not None:
+                    # Cek jika varian permintaan tersedia
+                    row_req = item_df[item_df['id'] == var_id]
+                    if not row_req.empty and row_req.iloc[0]['stock_qty'] >= qty_total:
+                        chosen_variant_id = var_id
+                if chosen_variant_id is None:
+                    for prefix in ['P', 'L', 'C', 'X']:
+                        sel = variants_ready[variants_ready['name'].str.startswith(prefix)]
+                        if not sel.empty:
+                            chosen_variant_id = sel['id'].iloc[0]
+                            break
+                if chosen_variant_id is None:
+                    logger.error("Tidak dapat pilih varian untuk produk %s", product_id)
+                    return f"Stok varian tidak mencukupi untuk {item.get('product_name')}."
+                idx = f"{product_id}|{chosen_variant_id}"
+            # Tambah ke order
+            logger.debug("Menambahkan paket-item: %s, qty: %s", idx, qty_total)
+            print(f"PAKET {item['product_name']:<45} {idx:<15} {qty_total:<15}")
+
+            try:
+                resp = add_prod_to_order(order_id, idx, qty_total, access_token=access_token)
+                logger.debug("Response add paket-item: %s", getattr(resp, 'text', ''))
+            except requests.exceptions.HTTPError as http_err:
+                logger.error("HTTPError add paket-item: %s", http_err)
+                return "Ada kesalahan HTTP saat memasukkan paket ke order."
+            except Exception as e:
+                logger.error("Error lain add paket-item: %s", e)
+                return f"Ada kesalahan saat memasukkan paket ke order. Error: {e}"
+            total_harga_normal += harga * qty_total
+
+        # Setelah semua ditambahkan, update diskon tiap item
+        try:
+            ord_detail = fetch_order_details(order_id=order_id, access_token=access_token)
+            paket_items_added = ord_detail['data']['orderitems'][-len(combo_items):]
+            harga_promo = float(combo_details['data']['sell_price_pos']) * qty_pesan
+        except Exception as e:
+            logger.error("Gagal fetch detail order untuk update diskon: %s", e)
+            return "Gagal update diskon paket."
+        # Hitung dan update tiap item
+        for item in paket_items_added:
+            item_id = item['id']
+            item_qty = item['qty']
+            try:
+                item_price = float(item['amount'])
+                # Hindari ZeroDivisionError
+                if total_harga_normal > 0:
+                    item_disc = item_price * ((total_harga_normal - harga_promo) / total_harga_normal)
+                else:
+                    item_disc = 0.0
+            except Exception:
+                item_disc = 0.0
+            # Ambil fprice bersih angka
+            try:
+                fprice_str = item.get('fprice', '').replace('.', '')
+                price_int = int(float(fprice_str)) if fprice_str else 0
+            except Exception:
+                price_int = 0
+            logger.debug("Update detail order item_id=%s, disc=%s, price=%s", item_id, item_disc, price_int)
+            try:
+                update_order_detail(
+                    order_id=str(order_id),
+                    id=str(item_id),
+                    disc=str(item_disc),
+                    price=str(price_int),
+                    qty=str(item_qty),
+                    note="Promo Paket",
+                    access_token=access_token
+                )
+            except Exception as e:
+                logger.error("Gagal update_order_detail untuk item_id %s: %s", item_id, e)
+                return "Gagal update detail paket di order."
+        return True
+
     def handle_order(self, query: str, access_token: str, sudah_bayar: bool = False):
-        print("[DEBUG] Query diterima:", query)
+        logger.debug("Query diterima: %s", query)
         reconfirm_json = self.reconfirm_translator(query)
-        print("[DEBUG] Hasil reconfirm:", reconfirm_json)
+        logger.debug("Hasil reconfirm: %s", reconfirm_json)
+        print("Hasil reconfirm:", reconfirm_json)
+
+
         if reconfirm_json.get('fallback'):
             print("[ERROR] Format pesan tidak sesuai:", reconfirm_json['fallback'])
             return reconfirm_json['fallback']
         
-        elif reconfirm_json.get('pembatalan'):
-            print("[DEBUG] Pembatalan order dengan ID:", reconfirm_json['pembatalan'])
-            update_status(reconfirm_json['pembatalan'], "X", access_token)
-            return f"Order dengan ID {reconfirm_json['pembatalan']} telah dibatalkan."
+        if reconfirm_json.get('pembatalan'):
+          print("[DEBUG] Pembatalan order dengan ID:", reconfirm_json['pembatalan'])
 
-        gemini_model = genai.GenerativeModel(
-            model_name=self.model_name,
-            system_instruction=task_instructions['notes_prompt'],
-        )
-        notes = gemini_model.generate_content(query)
+          # Kalau bentuknya string (bisa angka, bisa list string)
+          if isinstance(reconfirm_json['pembatalan'], str):
+              try:
+                  parsed = ast.literal_eval(reconfirm_json['pembatalan'])
+                  reconfirm_json['pembatalan'] = parsed
+              except Exception:
+                  # Kalau bukan list yang valid, asumsikan itu angka string
+                  if reconfirm_json['pembatalan'].isdigit():
+                      reconfirm_json['pembatalan'] = [reconfirm_json['pembatalan']]
+                  else:
+                      return "[ERROR] Format pembatalan tidak dikenali."
 
-        cust_id, cust_telp = cek_kastamer(
-            nomor_telepon=reconfirm_json['phone_num'],
-            access_token=access_token
-        )
+          # Kalau masih bukan list setelah semua itu, bungkus jadi list
+          if not isinstance(reconfirm_json['pembatalan'], list):
+              reconfirm_json['pembatalan'] = [str(reconfirm_json['pembatalan'])]
+
+          # Cek apakah list-nya kosong
+          if not reconfirm_json['pembatalan']:
+              print("[ERROR] Tidak ada ID yang diberikan untuk pembatalan.")
+              return "Tidak ada ID yang diberikan untuk pembatalan."
+
+          # Batalkan order
+          for order_id in reconfirm_json['pembatalan']:
+              try:
+                  update_status(order_id, "X", access_token)
+              except requests.exceptions.HTTPError as http_err:
+                  return f"Ada error dari Olsera API dalam membatalkan order {order_id}."
+              except Exception as err:
+                  return f"Ada kesalahan dalam membatalkan order {order_id}: {err}. Struk di-voidkan."
+
+          return f"Order dengan ID {', '.join(reconfirm_json['pembatalan'])} telah dibatalkan."
+
+        # gemini_model = genai.GenerativeModel(
+        #     model_name=self.model_name,
+        #     system_instruction=task_instructions['notes_prompt'],
+        # )
+        # notes = gemini_model.generate_content(query)
+
+        try:
+            gemini_model = genai.GenerativeModel(
+                model_name=self.model_name,
+                system_instruction=task_instructions['notes_prompt'],
+            )
+            notes = gemini_model.generate_content(query)
+            notes_text = getattr(notes, 'text', '') or ''
+            logger.debug("Notes dihasilkan: %s", notes_text)
+        except Exception as e:
+            logger.error("Gagal generate notes: %s", e)
+            notes_text = ""
+
+        # cust_id, cust_telp = cek_kastamer(
+        #     nomor_telepon=reconfirm_json['phone_num'],
+        #     access_token=access_token
+        # )
+
+        try:
+            kastamer = cek_kastamer(
+                nomor_telepon=reconfirm_json['phone_num'],
+                access_token=access_token
+            )
+        except Exception as e:
+            logger.error("Gagal cek atau buat customer: %s", e)
+            return "Gagal memproses data pelanggan."
+
+        cust_telp = reconfirm_json['phone_num']
+        if kastamer is None:
+            cust_id = None
+            cust_name = reconfirm_json['cust_name']
+        else:
+            cust_id = kastamer[0]
+            cust_name = kastamer[1]
 
         # Create order
-        order_id, order_no = create_order(
-            order_date=f"{datetime.now().strftime('%Y-%m-%d')}",
-            customer_id=cust_id,
-            nama_kastamer=reconfirm_json['cust_name'],
-            nomor_telepon=cust_telp,
-            notes=notes.text,
-            access_token=access_token
-        )
-
-        print(f"[DEBUG] ID Order berhasil dibuat: {order_id}, Nomor: {order_no}")
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        try:
+            order_id, order_no = create_order(
+                order_date=today_str,
+                customer_id=cust_id,
+                nama_kastamer=cust_name,
+                nomor_telepon=cust_telp,
+                notes=notes_text,
+                access_token=access_token
+            )
+            logger.debug("Order dibuat: ID=%s, No=%s", order_id, order_no)
+            print(f"Order ID: {order_id}, Order No: {order_no}")
+        except Exception as e:
+            logger.error("Gagal membuat order: %s", e)
+            return "Terjadi kesalahan, gagal membuat order baru. Mohon coba lagi."
+            
 
         # print(reconfirm_json)
         print("PESANAN RECONFIRM")
@@ -443,242 +721,96 @@ class AgentBabe:
         print("-" * 75)
 
         # Add products to order
-        for product in reconfirm_json['ordered_products']:
+        ordered_products = reconfirm_json.get('ordered_products', [])
+        for product in ordered_products:
             # print(f"\n[DEBUG] Memproses produk: {product['produk']} | Tipe: {product['tipe']}")
-            if product['tipe'].lower() == 'item':
-                df = self.product_df[self.product_df['pos_hidden'] == 0] # Pastikan untuk menunjukkan produk yang tidak tersembunyi di POS.
-                idx = self.select_id_by_agent(product['produk'], df, self.instructions['item_selection_prompt'], id_col='id', evaluation_col='name')
-                if idx is None:
-                    # print(f"[ERROR] Gagal menemukan produk {product['produk']} dalam daftar produk.")
-                    continue
-                df = df[df['id'] == idx].reset_index(drop=True)
-                
-                # print("[DEBUG] ID produk terpilih:", idx)
+            tipe = product.get('tipe', '').lower()
+            nama_produk = product.get('produk', '')
+            qty = product.get('quantity', 0)
+            
+            if not nama_produk or qty <= 0:
+                logger.warning("Produk diabaikan karena nama/qty tidak valid: %s", product)
+                continue
 
-                if df['variants'][0] != '[]':
-                    # Reformat to Series
-                    variants = ast.literal_eval(df['variants'][0])
-                    variants = pd.DataFrame(variants)
+            if tipe == 'item':
+                success, msg = self._process_item(order_id, nama_produk, qty, access_token)
 
-                    variants_ready = variants[variants['stock_qty'] > 0]
-                    prioritas = ['L', 'P', 'C']
-
-                    # print("[DEBUG] Varian tersedia:")
-                    # print(variants_ready)
-
-                    for prefix in prioritas:
-                        selected_variant = variants_ready[variants_ready['name'].str.startswith(prefix)]
-                        if not selected_variant.empty:
-                            variant_name = selected_variant['name'].iloc[0]
-                            variant_id = selected_variant['id'].iloc[0]
-
-                            # print(f"ITEM {variant_name:<40} {variant_id:<10}")
-
-                            idx = f"{idx}|{variant_id}"
-                            # print(f"[DEBUG] Varian {prefix} terpilih:", variant_name, variant_id)
-                            break
-                
-                # print(f"[DEBUG] Menambahkan produk ke order: {idx} | Qty: {product['quantity']}")
-                print(f"ITEM  {df['name'].iloc[0]:<45} {idx:<15} {product['quantity']:<15}")
-                try:
-                  resp = add_prod_to_order(order_id, idx, product['quantity'], access_token=access_token) # Masih template, belum fungsional
-                except requests.exceptions.HTTPError as http_err:
-                    print(f"Ada kesalahan pada inputting, struk di void-kan: {http_err} - Response: {resp.text}")
+                if not success:
+                    # Jika error di dalam, void entire order dan return
                     update_status(order_id, "X", access_token)
-                    return f"Ada kesalahan dalam memasukkan produk ke order: {http_err} - {resp.text}. Struk di-voidkan."
-                except Exception as err:
-                    print(f"Ada kesalahan lain pada inputting, struk di void-kan: {err}")
+                    return f"Ada kesalahan saat menambahkan item, struk di-void. Error: {msg}"
+
+            elif tipe == 'paket':
+                success_or_msg = self._process_paket(order_id, nama_produk, qty, access_token)
+                if success_or_msg is not True:
+                    # Jika mengembalikan string pesan error, batalkan order
                     update_status(order_id, "X", access_token)
-                    return f"Ada kesalahan dalam memasukkan produk ke order: {http_err}. Struk di-voidkan."
-
-            elif product['tipe'].lower() == 'paket':
-                df = self.combo_df[self.combo_df['pos_hidden'] == 0] # Pastikan untuk menunjukkan paket yang tidak tersembunyi di POS.
-                task_instruction = self.instructions['combo_selection_prompt']
-
-                product_name_lower = product['produk'].strip().lower()
-
-                # Subset berdasarkan awalan:
-                if product_name_lower.startswith('merch') or product_name_lower.startswith('mer') or 'merch' in product_name_lower:
-                    mask = df['name'].str.lower().str.contains('merch|merh')
-                    df = df[mask]
-                    task_instruction = self.instructions['merch_selection_prompt']
-
-                elif product_name_lower.startswith(('babe garansiin','garansi','garan')):
-                    df = df[df['name'] == 'Babe Garansi-in !!!']
-                    task_instruction = self.instructions['garansi_selection_prompt']
-
-                elif 'kupon' in product_name_lower:
-                    mask = df['name'].str.lower().str.contains('kupon')
-                    df = df[mask]
-                    task_instruction = self.instructions['kupon_selection_prompt']
-                
-                elif 'voucher' in product_name_lower:
-                    mask = df['name'].str.lower().str.contains('voucher')
-                    df = df[mask]
-                    task_instruction = self.instructions['voucher_selection_prompt']
-
-                elif product_name_lower.startswith(('komplimen', 'komp')):
-                    mask = df['name'].str.lower().str.startswith(('komplimen','komp'))
-                    df = df[mask]
-                    task_instruction = self.instructions['komplimen_selection_prompt']
-
-                elif 'delivery' in product_name_lower:
-                    mask = df['name'].str.lower().str.contains('delivery')
-                    df = df[mask]
-                    task_instruction = self.instructions['delivery_selection_prompt']
-
-                elif product_name_lower.startswith('hadiah'):
-                    df = df[df['name'].str.lower().str.startswith('hadiah')]
-                    task_instruction = self.instructions['hadiah_selection_prompt']
-
-                if len(df) < 2:
-                    idx = df['id'].iloc[0] if not df.empty else None
-                else:
-                    idx = self.select_id_by_agent(product['produk'], df, task_instruction, id_col='id', evaluation_col='name')
-                if idx is None:
-                    print(f"[ERROR] Gagal menemukan produk {product['produk']} dalam daftar produk.")
-                    continue
-
-                # Retrieve data dari combo detail.
-                # print(f"[DEBUG] ID paket terpilih:", idx)
-                combo_details = fetch_product_combo_details(idx, access_token)
-                # print("[DEBUG] Detail paket:", combo_details)
-                combo_items = combo_details['data']['items']['data']
-
-                total_harga_normal = 0
-
-                # Tambahkan dulu produk paket ke order
-                for item in combo_items:
-                    qty = item['qty'] * product['quantity']  # Mengalikan qty paket dengan qty yang dipesan
-
-                    item_details = fetch_product_item_details(item['product_id'], access_token=access_token)
-                    product_data = item_details.get('data', {})
-
-                    if len(product_data['variant']) == 0:
-                        idx = f"{item['product_id']}"
-                        harga = f"{product_data['sell_price_pos']}"
-                    else:
-                        item_details = item_details['data']['variant']
-                        item_details_df = pd.DataFrame(item_details)
-                        harga = item_details_df['sell_price_pos'].iloc[0] if not item_details_df.empty else None
-
-                        if 'stock_qty' not in item_details_df.columns:
-                            print(f"[ERROR] Data stok tidak ditemukan untuk {item['product_name']} (ID: {item['product_id']}). Struk akan di-void.")
-                            update_status(order_id, "X", access_token)
-                            return f"Data stok tidak ditemukan untuk {item['product_name']} dalam database. Struk di-voidkan."
-
-                        variants_ready = item_details_df[item_details_df['stock_qty'] >= qty]  # Lebih baik pakai >=
-
-                        if variants_ready.empty:
-                            print(f"[ERROR] Tidak ada stok yang cukup untuk {item['product_name']} (ID: {item['product_id']}). Struk akan di-void.")
-                            update_status(order_id, "X", access_token)
-                            return f"Maaf, stok tidak cukup untuk {item['product_name']} dalam database. Struk di-voidkan."
-
-                        
-                        prioritas = ['P', 'L', 'C', 'X']
-
-                        if variants_ready[variants_ready['id'] == item['product_variant_id']]['stock_qty'].iloc[0] < qty:
-                            # Jika varian yang diminta tidak tersedia, cari varian lain
-                            print(f"[DEBUG] Varian {item['product_variant_id']} tidak tersedia untuk {item['product_name']}. Mencari varian lain...")
-                            for prefix in prioritas:
-                                selected_variant = variants_ready[variants_ready['name'].str.startswith(prefix)]
-
-                                if not selected_variant.empty:
-                                    variant_name = selected_variant['name'].iloc[0]
-                                    variant_id = selected_variant['id'].iloc[0]
-
-                                    # print(f"ITEM {variant_name:<40} {variant_id:<10}")
-
-                                    idx = f"{item_details_df['product_id'].iloc[0]}|{variant_id}"
-                                    # print(f"[DEBUG] Varian {prefix} terpilih:", variant_name, variant_id)
-                                    break
-                        else:
-                            # Jika varian yang diminta tersedia, gunakan varian tersebut
-                            idx = f"{item['product_id']}|{item['product_variant_id']}"
-
-                    print(f"PAKET {item['product_name']:<45} {idx:<15} {qty:<15}")
-                    total_harga_normal += float(harga) * qty
-
-                    try:
-                        resp = add_prod_to_order(order_id, idx, qty, access_token=access_token) # Masih template, belum fungsional
-                    except requests.exceptions.HTTPError as http_err:
-                        print(f"Ada kesalahan pada inputting, struk di void-kan: {http_err} - Response: {resp.text}")
-                        update_status(order_id, "X", access_token)
-                        return f"Ada kesalahan dalam memasukkan produk ke order: {http_err} - {resp.text}. Struk di-voidkan."
-                    except Exception as err:
-                        print(f"Ada kesalahan lain pada inputting, struk di void-kan: {err}")
-                        update_status(order_id, "X", access_token)
-                        return f"Ada kesalahan dalam memasukkan produk ke order: {http_err}. Struk di-voidkan."
-
-                # Baru setelah semua item paket ditambahkan, hitung diskon masing-masing item
-                ord_detail = fetch_order_details(order_id=order_id, access_token=access_token)
-                paket_items = ord_detail['data']['orderitems'][-len(combo_items):]
-                harga_promo = float(combo_details['data']['sell_price_pos']) * product['quantity']
-
-                for item in paket_items:
-                    item_id = item['id']
-                    item_qty = item['qty']
-                    item_price = int(float(item['amount']))
-                    try:
-                      item_disc = (item_price * ((total_harga_normal - harga_promo) / total_harga_normal))
-                    except:
-                      item_disc = 0
-                    # print(f"[DEBUG] Memperbarui detail order ID {item_id} dengan diskon {item_disc} dan harga {harga_promo}")
-                    update_order_detail(
-                        order_id=str(order_id),
-                        id=str(item_id),
-                        disc=f"{item_disc}",
-                        price=f"{int(float(item['fprice'].replace('.', '')))}",
-                        qty=str(item_qty),
-                        note="Promo Paket",
-                        access_token=access_token
-                    )                
-                
+                    return success_or_msg
+            
             else:
                 print(f"[ERROR] Jenis tidak dikenali. Pastikan untuk memasukkan produk dengan kurung () yang menjelaskan jenis produk, apakah item atau paket. Misal: Hennesey 650 mL (item). Anda memasukkan: {product['tipe']}")
                 continue
 
-        # Lanjut ke proses transaksi dan close order. tbd.
-        order_details = fetch_order_details(order_id, access_token)
-        if sudah_bayar or reconfirm_json['status'].lower() == 'lunas':
-            payment_id = list_payment_modes(order_id, access_token)[payment_dict[reconfirm_json['payment_type']]]['id']
-            update_payment(
-                order_id=order_id,
-                payment_amount=f"{int(float(order_details['data']['total_amount']))}",
-                payment_date=f"{datetime.now().strftime('%Y-%m-%d')}",
-                payment_mode_id=f"{payment_id}", 
-                access_token=access_token,
-                payment_payee="Kevin Tes API Agent AI",
-                payment_seq="0",
-                payment_currency_id="IDR"
-            )
+        try:
+            order_details = fetch_order_details(order_id, access_token)
+        except Exception as e:
+            logger.error("Gagal fetch detail order setelah tambah produk: %s", e)
+            return "Gagal mengambil detail order."
+        status = reconfirm_json.get('status', '').lower()
+        if sudah_bayar or status == 'lunas':
+            try:
+                # Ambil ID metode pembayaran
+                payment_modes = list_payment_modes(order_id, access_token)
+                # payment_dict: mapping nama pembayaran ke indeks
+                jenis = reconfirm_json.get('payment_type', '')
+                idx = payment_dict.get(jenis)
+                if idx is None or idx >= len(payment_modes):
+                    logger.warning("Metode pembayaran '%s' tidak dikenal", jenis)
+                    # lanjutkan tanpa bayar atau return error?
+                else:
+                    payment_id = payment_modes[idx]['id']
+                    total_amount = int(float(order_details['data']['total_amount']))
+                    update_payment(
+                        order_id=order_id,
+                        payment_amount=str(total_amount),
+                        payment_date=today_str,
+                        payment_mode_id=str(payment_id),
+                        access_token=access_token,
+                        payment_payee="Kevin Tes API Agent AI",
+                        payment_seq="0",
+                        payment_currency_id="IDR"
+                    )
+                    update_status(order_id, "Z", access_token)
+                    logger.debug("Order %s ditandai lunas dan status diupdate.", order_id)
+            except Exception as e:
+                logger.error("Gagal proses pembayaran: %s", e)
+                # Tidak membatalkan order karena produk sudah masuk; tergantung kebijakan.
+        
+        # 8. Cetak struk
+        try:
+            struk_url = cetak_struk(order_no, cust_telp)
+        except Exception as e:
+            logger.error("Gagal cetak struk: %s", e)
+            struk_url = None
 
-            update_status(order_id, "Z", access_token)
-
-        struk = cetak_struk(order_no, cust_telp)
-
-        pending_line = "*PENDING ORDER*\n" if not reconfirm_json['status'].lower() == 'lunas' else ""
-
-        invoice = f'''{pending_line}Nama: {reconfirm_json['cust_name']}
-Nomor Telepon: {reconfirm_json['phone_num']}
-Alamat: {reconfirm_json['address']}
-Order ID: {order_id} (Gunakan ID ini untuk melakukan voiding jika ada kesalahan atau pengembalian)
-Resi: {order_no}
-
-*MAKSIMAL DILUNCURKAN DARI GUDANG*: {(datetime.now() + timedelta(minutes=35)).strftime('%H:%M')}
-
-Jarak: XXX km 
-
-Thank you for shopping with Kulkas Babe!
-Total Order: {order_details['data']['ftotal_amount']}
-View Receipt: {struk}
-
-Jenis Pengiriman: {reconfirm_json['jenis_pengiriman']}
-
-Notes: {reconfirm_json['notes'] if reconfirm_json['notes'] else "Tidak ada catatan tambahan."}
-'''
-
-        if struk is None:
-            struk = "Ada kesalahan dalam mencetak struk. Tolong kirim ulang."
-            return struk
+        # 9. Buat invoice teks
+        pending_line = "*PENDING ORDER*\n" if status != 'lunas' else ""
+        max_luncur = (datetime.now() + timedelta(minutes=35)).strftime('%H:%M')
+        total_ftotal = order_details['data'].get('ftotal_amount', '')
+        invoice_lines = [
+            pending_line.strip(),
+            f"Nama: {reconfirm_json.get('cust_name', '')}",
+            f"Nomor Telepon: {reconfirm_json.get('phone_num', '')}",
+            f"Alamat: {reconfirm_json.get('address', '')}",
+            f"Order ID: {order_id} (Gunakan ID ini untuk void jika perlu)",
+            f"Resi: {order_no}",
+            f"MAKSIMAL DILUNCURKAN DARI GUDANG: {max_luncur}",
+            "Jarak: XXX km",
+            "Makasih yaa Cah udah Jajan di Babe!",
+            f"Total Jajan: {total_ftotal}",
+            f"Cek Jajanmu di sini: {struk_url or 'Gagal mencetak struk. Tolong ulangi.'}",
+            f"Jenis Pengiriman: {reconfirm_json.get('jenis_pengiriman', '')}",
+            f"Notes: {reconfirm_json.get('notes') or 'Tidak ada catatan tambahan.'}",
+        ]
+        invoice = "\n".join([line for line in invoice_lines if line is not None])
         return invoice
