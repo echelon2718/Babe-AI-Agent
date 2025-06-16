@@ -56,6 +56,7 @@ def cek_kastamer(nomor_telepon: str, access_token: str) -> tuple:
         return data['data'][0]['id'], data['data'][0]['name'] if data['data'] else None
     except requests.exceptions.HTTPError as http_err:
         print(f"HTTP error occurred: {http_err} - Response: {response.text}")
+        return None
     except Exception as err:
         print(f"Other error occurred: {err}")
         return {}
@@ -117,18 +118,19 @@ def add_prod_to_order(order_id: str, product_id: str, quantity: int, access_toke
         "Content-Type": "application/json"
     }
 
-    response = requests.post(url, json=params, headers=headers)
-    response.raise_for_status()  # Akan memunculkan exception jika status bukan 2xx
-    return response.json()
+    # response = requests.post(url, json=params, headers=headers)
+    # response.raise_for_status()  # Akan memunculkan exception jika status bukan 2xx
+    # return response.json()
 
-    # try:
-    #     response = requests.post(url, json=params, headers=headers)
-    #     response.raise_for_status()  # Akan memunculkan exception jika status bukan 2xx
-    #     return response.json()
-    # except requests.exceptions.HTTPError as http_err:
-    #     print(f"HTTP error occurred on product inputting: {http_err} - Response: {response.text}")
-    # except Exception as err:
-    #     print(f"Other error occurred on product inputting: {err}")
+    try:
+        response = requests.post(url, json=params, headers=headers)
+        response.raise_for_status()  # Akan memunculkan exception jika status bukan 2xx
+        return response.json()
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred on product inputting: {http_err} - Response: {response.text}")
+        return response.json()
+    except Exception as err:
+        print(f"Other error occurred on product inputting: {err}")
 
 def get_product_item_df(access_token, page=1):
     url = "https://api-open.olsera.co.id/api/open-api/v1/en/product"
