@@ -12,7 +12,7 @@ genai_api_key = os.getenv("GOOGLE_GENAI_API_KEY")
 genai.configure(api_key=genai_api_key)
 
 # === Konfigurasi koneksi RabbitMQ ===
-agent = AgentBabe(df_combo_dir='./product_combos.csv', df_product_dir='./product_items.csv', top_k_retrieve=15)
+agent = AgentBabe(df_combo_dir='./product_combos.csv', df_product_dir='./product_items.csv', top_k_retrieve=20)
 credentials = pika.PlainCredentials('guest', 'guest')
 parameters = pika.ConnectionParameters(
     host='31.97.106.30',
