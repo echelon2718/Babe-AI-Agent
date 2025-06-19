@@ -7,7 +7,7 @@ import json
 import pandas as pd
 import requests
 import ast
-from modules.crud_utility import add_prod_to_order, update_payment, fetch_product_combo_details, fetch_order_details, update_order_detail, cek_kastamer, create_order, list_payment_modes, update_status, cetak_struk, fetch_product_item_details, update_order_attr
+from modules.crud_utility import add_prod_to_order, update_payment, fetch_product_combo_details, fetch_order_details, update_order_detail, cek_kastamer, create_order, list_payment_modes, update_status, cetak_struk, fetch_product_item_details, update_order_attr, void_order
 from datetime import datetime, timedelta
 import logging
 from typing import Optional, Tuple, Dict, Any
@@ -39,7 +39,8 @@ Alamat: Jl. Ahmad Saleh No. 123, Jakarta (Harus ada)
 Payment: BCA (Harus ada, pilihannya BCA, BRI, Cash, QRIS, atau Hutang. Jika selain ini, anggap sebagai Cash)
 Tuker Voucher: Tumblr (Tidak wajib, jika tidak ada, kosongkan saja; default quantity = 1)
 Notes: Es Batu, Sticker 3 (Tidak wajib, jika tidak ada, kosongkan saja)
-Pengiriman: FD (Tidak wajib, default "SD", jika tidak disebutkan)
+Disc: 10% (Tidak wajib, jika tidak ada, kosongkan saja)
+Pengiriman: FD (Tidak wajib, default "SD", jika tidak disebutkan, pilihannya FD, ID, EX)
 
 Jika ada permintaan untuk melakukan voiding seperti, "batalkan struk <ID>", "void struk <ID>", atau "batalkan order <ID>", maka kembalikan pesan dengan format:
 {
@@ -56,6 +57,8 @@ Tapi pastikan ada IDnya, jika tidak ada ID, kembalikan pesan dengan format:
 {
   "cust_name": <str>,
   "phone_num": <str>,
+  "mode_diskon": <"number"|"percentage">,
+  "disc": <float> (default 0.0, jika tidak ada disc, kosongkan saja),
   "ordered_products": [
     {
       "tipe": <"Paket"|"Item">,
@@ -74,6 +77,8 @@ Tapi pastikan ada IDnya, jika tidak ada ID, kembalikan pesan dengan format:
 Keterangan:
 - cust_name: Nama pelanggan.
 - phone_num: Nomor telepon pelanggan.
+- mode_diskon: "number" jika diskon dalam format angka (misal 1000), "percentage" jika diskon dalam format persentase (misal 10% = 0.1). Jika tidak ada diskon, defaultnya "percentage".
+- disc: Diskon dalam format desimal (misal 10% = 0.1). Jika tidak ada diskon, kosongkan saja.
 - ordered_products: Array objek, satu per produk atau voucher:
   a.) tipe: "Paket" untuk produk berjenis paket/voucher (lihat daftar di bawah), "Item" untuk produk perbiji atau tambahan seperti es batu atau stiker. INGAT!! bahwa "Item" tidak mungkin berisi lebih dari satu produk dalam satu kuantitas. Jadi jika user meminta "Atlas Lychee 2 Botol Promo (Paket)", maka tipe-nya adalah "Paket". Jika user meminta "3 Anggur Merah 500 mL (Item)", maka tipe-nya adalah "Item".
   b.) produk: Nama paket atau item persis seperti di pesan.
@@ -84,8 +89,8 @@ Keterangan:
 - notes: Semua permintaan khusus selain ordered_products. Jika pelanggan meminta rokok atau bawain sesuatu, atau layanan di luar delivery alkohol, jadikan notes serta tambahkan item "Nitip ke Jagoane Babe (Item)" dengan quantity 1, kecuali jika minta es batu, cup, atau stiker, maka tambahkan sebagai produk terpisah dengan tipe "Item" dan quantity sesuai permintaan.
 - PASTIKAN UNTUK MEMETAKAN INPUT KE TIPE "Item" JIKA ADA KURUNG BERTULISAN (Item) ATAU KE TIPE "Paket" JIKA ADA KURUNG BERTULISAN (Paket). Misal: "3 botol Atlas Lychee 600 mL (Item)" => tipe "Item", quantity 3, "4 paket Atlas Lychee 2 Botol Promo (Paket)" => tipe "Paket", quantity 4.
 
-"jenis_pengiriman": Jenis pengiriman, SD: standard delivery, FD: fast delivery, EX: express. Nilai defaultnya "SD", jika tidak disebutkan
-"status": Status pembayaran, "Lunas" jika sudah bayar, "Pending" jika belum bayar. Nilai defaultnya "Lunas", jika tidak disebutkan.
+- jenis_pengiriman: Jenis pengiriman, FD: free delivery, ID: instant delivery, EX: express. Nilai defaultnya "FD", jika tidak disebutkan. Jika FD, tambahkan Garansi ke dalam ordered_products. Jika ID, tambahkan "Instant Delivery (Paket)" ke dalam ordered_products quantity 1, tanpa Garansi. Jika EX, tambahkan "Express Delivery!! (Paket)" ke dalam ordered_products quantity 1, tanpa Garansi. 
+- status: Status pembayaran, "Lunas" jika sudah bayar, "Pending" jika belum bayar. Nilai defaultnya "Lunas", jika tidak disebutkan.
 
 3. Daftar tipe "Paket" tambahan:
 - Merch / Merh Babe / Polos XXX (XXX ini angka, misal "Merch Babe 1", "Merh Polos 2". Jadi jika pelanggan meminta "Merch Babe 2", maka tipe-nya adalah "Paket" dan produk-nya adalah "Merch Babe 2", quantity = 1, bukan "Merch Babe", quantity = 2)
@@ -125,12 +130,16 @@ Produk: Atlas Lychee 2 Botol Promo, Singleton 500 mL (Item) 3, 3 botol Anggur Me
 Tuker Voucher: Tumblr
 Alamat: Jl. Melati No. 5, Bandung
 Payment: QRIS
+Disc: 10%
 Notes: Es Batu, Sticker 2, nitip rokok
+
+EX, lunas
 
 Contoh Output JSON BENAR:
 {
   "cust_name": "Budi",
   "phone_num": "08987654321",
+  "disc": 0.1,
   "ordered_products": [
     {
       "tipe": "Paket",
@@ -158,6 +167,11 @@ Contoh Output JSON BENAR:
       "quantity": 1
     },
     {
+      "tipe": "Paket",
+      "produk": "Express Delivery!!",
+      "quantity": 1
+    },
+    {
       "tipe": "Item",
       "produk": "Nitip ke Jagoane Babe",
       "quantity": 1
@@ -166,13 +180,15 @@ Contoh Output JSON BENAR:
   "address": "Jl. Melati No. 5, Bandung",
   "payment_type": "QRIS",
   "notes": "Tambahan stiker 2, nitip rokok",
-  "jenis_pengiriman": "SD"
+  "jenis_pengiriman": "EX",
+  "status": "Lunas"
 }
 
 Contoh Output JSON SALAH (fallback):
 {
   "cust_name": "Budi",
   "phone_num": "08987654321",
+  "disc": 0.1,
   "ordered_products": [
     {
       "tipe": "Paket",
@@ -203,17 +219,27 @@ Contoh Output JSON SALAH (fallback):
   "address": "Jl. Melati No. 5, Bandung",
   "payment_type": "QRIS",
   "notes": "Tambahan stiker 2, nitip rokok",
-  "jenis_pengiriman": "SD"
+  "jenis_pengiriman": "EX",
+  "status": "Lunas"
 }
+
+CATATAN DISKON TAMBAHAN:
+- Diskon Atensi: 100%
+- Diskon Giveaway: 100%
+- Diskon Komplimen: 100%
+- Diskon KOL: 100%
+- Diskon Media Partner: 100%
+- Diskon Ngacara: 100%
+- Diskon RND: 100%
 '''
 
 item_selection_prompt = '''
 Anda adalah sebuah agent yang bertugas untuk memilih indeks data yang paling sesuai dengan prompt yang diberikan.
 Cukup jawab dengan nomor indeks data yang paling sesuai dengan prompt yang diberikan.
 Tidak perlu menjelaskan apapun, cukup jawab dengan nomor indeks data yang paling sesuai dengan format yang telah ditentukan.
-Jika ada produk yang punya tulisan "- I" atau "- O", utamakan "- I" dahulu.
+Jika ada produk yang punya tulisan "- I" atau "- O", utamakan "- I" dahulu. Jangan pilih "- O" jika tidak dituliskan secara eksplisit.
 
-CATATAN: JIKA PRODUK TIDAK SESUAI, JANGAN MENJAWAB APAPUN!
+CATATAN: JIKA TIDAK ADA PRODUK YANG SESUAI, JAWAB -99999
 '''
 
 combo_selection_prompt = '''
@@ -254,41 +280,51 @@ Output: 35122
 
 Input: "Kawa Merah Gold 2 Draft Beer Promo Juni"
 Output: 54133
+
+JIKA TIDAK ADA PAKET YANG SESUAI, JAWAB -99999
+PEMILIHAN ITEM TIDAK BOLEH SALAH TERUTAMA DALAM HAL KUANTITAS!!!!
 '''
 
 merch_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri merch dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri garansi yang paling sesuai dengan permintaan pelanggan dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA MERCH YANG SESUAI, JAWAB -99999
 '''
 
 garansi_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri garansi dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri garansi yang paling sesuai dengan permintaan pelanggan dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA GARANSI YANG SESUAI, JAWAB -99999
 '''
 
 kupon_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri kupon dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri kupon yang paling sesuai dengan permintaan pelanggan dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA KUPOON YANG SESUAI, JAWAB -99999
 '''
 
 voucher_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri voucher dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri voucher yang paling sesuai dengan permintaan pelanggan, harus bener-bener sesuai dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA VOUCHER YANG SESUAI, JAWAB -99999
 '''
 
 komplimen_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri komplimen dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri voucher yang paling sesuai dengan permintaan pelanggan, harus bener-bener sesuai dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA KOMPLIMEN YANG SESUAI, JAWAB -99999
 '''
 
 delivery_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri delivery dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri delivery yang paling sesuai dengan permintaan pelanggan, harus bener-bener sesuai dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA DELIVERY YANG SESUAI, JAWAB -99999
 '''
 
 hadiah_selection_prompt = '''
 Kamu adalah AI Agent Kasir untuk Kulkas Babe (@kulkasbabe.id), bertugas memilih satu entri hadiah dari daftar berikut berdasarkan permintaan pelanggan.
 Pilih satu entri hadiah yang paling sesuai dengan permintaan pelanggan, harus bener-bener sesuai dan tuliskan saja IDnya langsung, misal 228431 (tipe integer). Tidak perlu penjelasan atau teks tambahan.
+JIKA TIDAK ADA HADIAH YANG SESUAI, JAWAB -99999
 '''
 
 notes_prompt = '''
@@ -301,12 +337,13 @@ Nama: Kevin
 Nomor Telepon: 085853605806
 Produk: 3 botol QRO anggur merah 650 ml (Item); Paket 3 AO Mild (Paket); 1 buah Paket 2 Anggur Hijau MCD + Kawa (Paket); Ongkir 10K (Item)
 Alamat: Jl. Melati No. 5, Bandung
+Disc: 10%
 Payment: BCA
 Notes: Es Batu 3
 
 Contoh output:
 
-"Matur suwun cah, pesenanmu wis kami proses. Paket-paket promo sing mbok pesen Paket 2 Atlas Lychee, Paket 3 Botol Anker Lychee, lan Paket 3 Botol Vibe Lychee yoo."
+"Matur suwun cah, pesenanmu wis kami proses. Paket-paket promo sing mbok pesen Paket 2 Atlas Lychee, Paket 3 Botol Anker Lychee, lan Paket 3 Botol Vibe Lychee yoo. Kita juga nambahi diskon 10% kanggo pesenanmu."
 '''
 
 task_instructions = {
@@ -410,9 +447,9 @@ class AgentBabe:
     ):
         df = self.product_df[self.product_df['pos_hidden'] == 0]
         idx = self.select_id_by_agent(nama_produk, df, self.instructions['item_selection_prompt'], id_col='id', evaluation_col='name')
-        if idx is None:
+        if idx is None or idx == -99999:
             logger.error("Gagal menemukan produk item: %s", nama_produk)
-            return False
+            return False, "Gagal menemukan produk item."
 
         df_sel = df[df['id'] == idx].reset_index(drop=True)
 
@@ -422,9 +459,9 @@ class AgentBabe:
                 variants_df = pd.DataFrame(variants)
             except Exception as e:
                 logger.error("Gagal parse variants untuk produk %s: %s", idx, e)
-                return False
+                return False, "Gagal memproses varian produk."
             variants_ready = variants_df[variants_df['stock_qty'] > 0]
-            for prefix in ['L', 'P', 'C']:
+            for prefix in ['P', 'L', 'C']:
                 sel = variants_ready[variants_ready['name'].str.startswith(prefix)]
                 if not sel.empty:
                     variant_id = sel['id'].iloc[0]
@@ -540,7 +577,7 @@ class AgentBabe:
                     if not row_req.empty and row_req.iloc[0]['stock_qty'] >= qty_total:
                         chosen_variant_id = var_id
                 if chosen_variant_id is None:
-                    for prefix in ['P', 'L', 'C', 'X']:
+                    for prefix in ['P', 'L', 'C']:
                         sel = variants_ready[variants_ready['name'].str.startswith(prefix)]
                         if not sel.empty:
                             chosen_variant_id = sel['id'].iloc[0]
@@ -622,16 +659,16 @@ class AgentBabe:
           print("[DEBUG] Pembatalan order dengan ID:", reconfirm_json['pembatalan'])
 
           # Kalau bentuknya string (bisa angka, bisa list string)
-          if isinstance(reconfirm_json['pembatalan'], str):
-              try:
-                  parsed = ast.literal_eval(reconfirm_json['pembatalan'])
-                  reconfirm_json['pembatalan'] = parsed
-              except Exception:
-                  # Kalau bukan list yang valid, asumsikan itu angka string
-                  if reconfirm_json['pembatalan'].isdigit():
-                      reconfirm_json['pembatalan'] = [reconfirm_json['pembatalan']]
-                  else:
-                      return "[ERROR] Format pembatalan tidak dikenali."
+        #   if isinstance(reconfirm_json['pembatalan'], str):
+        #       try:
+        #           parsed = ast.literal_eval(reconfirm_json['pembatalan'])
+        #           reconfirm_json['pembatalan'] = parsed
+        #       except Exception:
+        #           # Kalau bukan list yang valid, asumsikan itu angka string
+        #           if reconfirm_json['pembatalan'].isdigit():
+        #               reconfirm_json['pembatalan'] = [reconfirm_json['pembatalan']]
+        #           else:
+        #               return "[ERROR] Format pembatalan tidak dikenali."
 
           # Kalau masih bukan list setelah semua itu, bungkus jadi list
           if not isinstance(reconfirm_json['pembatalan'], list):
@@ -645,7 +682,12 @@ class AgentBabe:
           # Batalkan order
           for order_id in reconfirm_json['pembatalan']:
               try:
-                  update_status(order_id, "X", access_token)
+                #   update_status(order_id, "X", access_token)
+                  stat_void = void_order(order_id, access_token)
+                  if stat_void:
+                      print(f"Order {order_id} berhasil di-void.")
+                  else:
+                      raise ValueError(f"Order {order_id} tidak ditemukan atau gagal di-void.")
               except requests.exceptions.HTTPError as http_err:
                   return f"Ada error dari Olsera API dalam membatalkan order {order_id}."
               except Exception as err:
@@ -750,6 +792,9 @@ class AgentBabe:
             else:
                 print(f"[ERROR] Jenis tidak dikenali. Pastikan untuk memasukkan produk dengan kurung () yang menjelaskan jenis produk, apakah item atau paket. Misal: Hennesey 650 mL (item). Anda memasukkan: {product['tipe']}")
                 continue
+        
+        # Tambahkan diskon
+        self.add_discount(order_id, mode=reconfirm_json['mode_diskon'], access_token=access_token, discount=reconfirm_json['disc'], notes="")
 
         try:
             order_details = fetch_order_details(order_id, access_token)
@@ -796,21 +841,78 @@ class AgentBabe:
         # 9. Buat invoice teks
         pending_line = "*PENDING ORDER*\n" if status != 'lunas' else ""
         max_luncur = (datetime.now() + timedelta(minutes=35)).strftime('%H:%M')
+        max_luncur_line = f"MAKSIMAL DILUNCURKAN DARI GUDANG: {max_luncur}" if reconfirm_json.get('jenis_pengiriman') == 'FD' else ""
+
         total_ftotal = order_details['data'].get('ftotal_amount', '')
         invoice_lines = [
             pending_line.strip(),
             f"Nama: {reconfirm_json.get('cust_name', '')}",
             f"Nomor Telepon: {reconfirm_json.get('phone_num', '')}",
             f"Alamat: {reconfirm_json.get('address', '')}",
-            f"Order ID: {order_id} (Gunakan ID ini untuk void jika perlu)",
-            f"Resi: {order_no}",
-            f"MAKSIMAL DILUNCURKAN DARI GUDANG: {max_luncur}",
+            "",
+            "",
+            max_luncur_line.strip(),
             "Jarak: XXX km",
+            "",
+            "",
             "Makasih yaa Cah udah Jajan di Babe!",
             f"Total Jajan: {total_ftotal}",
             f"Cek Jajanmu di sini: {struk_url or 'Gagal mencetak struk. Tolong ulangi.'}",
             f"Jenis Pengiriman: {reconfirm_json.get('jenis_pengiriman', '')}",
-            f"Notes: {reconfirm_json.get('notes') or 'Tidak ada catatan tambahan.'}",
+            f"*NOTES: {reconfirm_json.get('notes') or 'Tidak ada catatan tambahan.'}*",
         ]
         invoice = "\n".join([line for line in invoice_lines if line is not None])
         return invoice
+    
+    def add_discount(self, order_id, mode, access_token, discount=0, notes=""):
+        ord_dtl = fetch_order_details(order_id, access_token)
+        order_list = ord_dtl['data'].get('orderitems', [])
+        id_order = ord_dtl['data'].get('id', 0)
+        total_price = float(ord_dtl['data'].get('total_amount', 0))
+        order_list = pd.DataFrame(ord_dtl['data'].get('orderitems', []))
+        order_list = order_list[order_list['amount'].astype(float) > 0].reset_index(drop=True)
+
+        for index, row in order_list.iterrows():
+            item_id = row['id']
+            item_qty = row['qty']
+            try:
+                # print("COBA UPDATE DISKON")
+                # print("HARGA TOTAL", total_price)
+                # print("DISKON", discount)
+                # print("MODE DISKON", mode)
+                item_price = float(row['amount'])
+                # Hindari ZeroDivisionError
+                if total_price > 0 and mode == 'number':
+                    item_disc = float(row['discount']) + item_price * (discount / total_price) 
+                
+                elif total_price > 0 and mode == 'percentage':
+                    item_disc = float(row['discount']) + item_price * discount
+                
+                else:
+                    raise ValueError("Mode diskon tidak dikenali atau total_price nol.")
+
+                # print(f"[DEBUG] item_id={item_id}, item_price={item_price}, row_discount={row['discount']}, discount={discount}, item_disc={item_disc}")
+                # print("BERHASIL UPDATE DISKON: ", item_disc)
+            except Exception as e:
+                print(f"Error calculating discount for item {item_id}: {e}")
+                item_disc = 0.0
+            # Ambil fprice bersih angka
+            try:
+                fprice_str = row.get('fprice', '').replace('.', '')
+                price_int = int(float(fprice_str)) if fprice_str else 0
+            except Exception:
+                price_int = 0
+
+            try:
+                update_order_detail(
+                    order_id=str(id_order),
+                    id=str(item_id),
+                    disc=str(item_disc),
+                    price=str(price_int),
+                    qty=str(item_qty),
+                    note=notes,
+                    access_token=access_token
+                )
+            except Exception as e:
+                print(f"Error updating order detail for item {item_id}: {e}")
+                return False, f"Gagal update detail order untuk item {item_id}: {e}"
