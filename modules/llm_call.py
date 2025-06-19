@@ -343,7 +343,7 @@ Notes: Es Batu 3
 
 Contoh output:
 
-"Matur suwun cah, pesenanmu wis kami proses. Paket-paket promo sing mbok pesen Paket 2 Atlas Lychee, Paket 3 Botol Anker Lychee, lan Paket 3 Botol Vibe Lychee yoo. Kita juga nambahi diskon 10% kanggo pesenanmu."
+"Makasih yaa (nama) niii Jajan mu langsung ta proses duluu. Paket nyaa (sebutkan paketnya) yah."
 '''
 
 task_instructions = {
