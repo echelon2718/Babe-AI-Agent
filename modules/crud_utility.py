@@ -241,6 +241,55 @@ def fetch_product_combo_details(combo_id: str, access_token: str):
     except Exception as err:
         print(f"Other error occurred: {err}")
 
+def fetch_open_ord_id_via_resi(resi: str, access_token: str):
+    url = "https://api-open.olsera.co.id/api/open-api/v1/en/order/openorder"
+
+    params = {
+        "search_column[]": "order_no",
+        "search_text[]": resi,
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        response.raise_for_status()  # Raise error kalau bukan status 200-an
+        data = response.json()
+        if data and "data" in data:
+            return data["data"][0]["id"]
+        else:
+            print("No order found for the given resi.")
+            return None
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred: {http_err} - Response: {response.text}")
+    
+def fetch_close_ord_id_via_resi(resi: str, access_token: str):
+    url = "	https://api-open.olsera.co.id/api/open-api/v1/en/order/closeorder"
+
+    params = {
+        "search_column[]": "order_no",
+        "search_text[]": resi,
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        response.raise_for_status()  # Raise error kalau bukan status 200-an
+        data = response.json()
+        if data and "data" in data:
+            return data["data"][0]["id"]
+        else:
+            print("No order found for the given resi.")
+            return None
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred: {http_err} - Response: {response.text}")
+        return None
+
 def fetch_order_details(order_id: str, access_token: str):
     url = "https://api-open.olsera.co.id/api/open-api/v1/en/order/openorder/detail"
     params = {
@@ -386,6 +435,19 @@ def update_status(order_id: str, status: str, access_token: str) -> None:
         print(f"HTTP error occurred on order status update: {http_err} - Response: {response.text}")
     except Exception as err:
         print(f"Other error occurred on order status update: {err}")
+
+def void_order(order_no: str, access_token: str):
+    order_id = fetch_open_ord_id_via_resi(order_no, access_token)
+
+    if order_id is None:
+        order_id = fetch_close_ord_id_via_resi(order_no, access_token)
+    
+    if order_id is None:
+        print(f"Order ID not found for order number: {order_no}")
+        return False
+    
+    update_status(order_id, "X", access_token)
+    return True
 
 def cetak_struk(order_no: str, phone: str) -> str:
     url = f"https://invoice.olsera.co.id/pos-receipt?lang=id&store=kulkasbabe&order_no={order_no}"
