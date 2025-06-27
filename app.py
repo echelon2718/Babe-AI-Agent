@@ -9,10 +9,11 @@ pd.options.mode.chained_assignment = None  # default='warn'
 
 load_dotenv()
 genai_api_key = os.getenv("GOOGLE_GENAI_API_KEY")
+gmap_api_key = os.getenv("GMAP_API_KEY")
 genai.configure(api_key=genai_api_key)
 
 # === Konfigurasi koneksi RabbitMQ ===
-agent = AgentBabe(df_combo_dir='./product_combos.csv', df_product_dir='./product_items.csv', top_k_retrieve=20)
+agent = AgentBabe(df_combo_dir='./product_combos.csv', df_product_dir='./product_items.csv', top_k_retrieve=30, gmap_api_key=gmap_api_key)
 credentials = pika.PlainCredentials('guest', 'guest')
 parameters = pika.ConnectionParameters(
     host='31.97.106.30',
@@ -29,8 +30,12 @@ channel.queue_declare(queue='whatsapp_hook_queue', durable=True)
 channel.queue_declare(queue='whatsapp_message_queue', durable=True)
 
 # === Fungsi untuk membalas pesan ===
-def send_reply(from_number, to_number, order_body):
-    response_message = response_message = agent.handle_order(order_body, access_token_dir="./token_cache.json")
+def send_reply(from_number, to_number, order_body, mode="launch"):
+    if mode == "launch":
+        print(f"📥 Pesan diterima dari {to_number}: {order_body}")
+        response_message = agent.handle_order(order_body, access_token_dir="./token_cache.json")
+    else:
+        response_message = "Ada kesalahan dalam memproses pesan."
 
     payload = {
         "command": "send_message",
@@ -55,7 +60,7 @@ def callback(ch, method, properties, body):
         print(json.dumps(payload, indent=4))
 
         if payload.get("type") == "order":
-            from_number = "6289523804018"  # nomor WA bot kamu
+            from_number = "628123456789"  # nomor WA bot kamu
             to_number = payload.get("from")
             order_body = payload.get("body", "Pesanan tidak lengkap")
 
