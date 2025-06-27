@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 import ast
 from modules.crud_utility import add_prod_to_order, update_payment, fetch_product_combo_details, fetch_order_details, update_order_detail, cek_kastamer, create_order, list_payment_modes, update_status, cetak_struk, fetch_product_item_details, update_order_attr, void_order
+from modules.maps_utility import resolve_maps_shortlink, get_travel_distance, address_to_latlng, distance_cost_rule, is_free_delivery, estimasi_tiba
 from datetime import datetime, timedelta
 import logging
 from typing import Optional, Tuple, Dict, Any
@@ -37,10 +38,10 @@ Nomor Telepon: 08123456789 (Harus ada)
 Produk: Atlas Lychee 2 Botol Promo (Item/Paket, Harus ada, bisa lebih dari satu produk)
 Alamat: Jl. Ahmad Saleh No. 123, Jakarta (Harus ada)
 Payment: BCA (Harus ada, pilihannya BCA, BRI, Cash, QRIS, atau Hutang. Jika selain ini, anggap sebagai Cash)
-Tuker Voucher: Tumblr (Tidak wajib, jika tidak ada, kosongkan saja; default quantity = 1)
+Tukar Voucher: Tumblr (Tidak wajib, jika tidak ada, kosongkan saja; default quantity = 1)
 Notes: Es Batu, Sticker 3 (Tidak wajib, jika tidak ada, kosongkan saja)
 Disc: 10% (Tidak wajib, jika tidak ada, kosongkan saja)
-Pengiriman: FD (Tidak wajib, default "SD", jika tidak disebutkan, pilihannya FD, ID, EX)
+Pengiriman: FD (Tidak wajib, default "FD", jika tidak disebutkan, pilihannya FD, I, EX)
 
 Jika ada permintaan untuk melakukan voiding seperti, "batalkan struk <ID>", "void struk <ID>", atau "batalkan order <ID>", maka kembalikan pesan dengan format:
 {
@@ -56,8 +57,8 @@ Tapi pastikan ada IDnya, jika tidak ada ID, kembalikan pesan dengan format:
 
 {
   "cust_name": <str>,
-  "phone_num": <str>,
-  "mode_diskon": <"number"|"percentage">,
+  "phone_num": <str>, (normalisasikan nomor telepon, hapus spasi, strip, atau karakter lain yang tidak perlu, dengan format 08XXXXXX)
+  "mode_diskon": <"number"|"percentage"> (default "percentage", jika tidak ada mode diskon, isi dengan "percentage". WAJIB!!),
   "disc": <float> (default 0.0, jika tidak ada disc, kosongkan saja),
   "ordered_products": [
     {
@@ -70,14 +71,14 @@ Tapi pastikan ada IDnya, jika tidak ada ID, kembalikan pesan dengan format:
   "address": <str>,
   "payment_type": <"BCA"|"BRI"|"Cash"|"QRIS"|"Hutang">,
   "notes": <str>
-  "jenis_pengiriman":<"FD"|"EX"|"SD"> (default "SD")
+  "jenis_pengiriman":<"FD"|"EX"|"I"> (default "FD")
   "status": <"Lunas"|"Pending"> (default "Lunas")
 }
 
 Keterangan:
 - cust_name: Nama pelanggan.
 - phone_num: Nomor telepon pelanggan.
-- mode_diskon: "number" jika diskon dalam format angka (misal 1000), "percentage" jika diskon dalam format persentase (misal 10% = 0.1). Jika tidak ada diskon, defaultnya "percentage".
+- mode_diskon: "number" jika diskon dalam format angka (misal 1000 atau 1K atau 1k), "percentage" jika diskon dalam format persentase (misal 10% = 0.1). Jika tidak ada diskon, defaultnya "percentage".
 - disc: Diskon dalam format desimal (misal 10% = 0.1). Jika tidak ada diskon, kosongkan saja.
 - ordered_products: Array objek, satu per produk atau voucher:
   a.) tipe: "Paket" untuk produk berjenis paket/voucher (lihat daftar di bawah), "Item" untuk produk perbiji atau tambahan seperti es batu atau stiker. INGAT!! bahwa "Item" tidak mungkin berisi lebih dari satu produk dalam satu kuantitas. Jadi jika user meminta "Atlas Lychee 2 Botol Promo (Paket)", maka tipe-nya adalah "Paket". Jika user meminta "3 Anggur Merah 500 mL (Item)", maka tipe-nya adalah "Item".
@@ -89,11 +90,12 @@ Keterangan:
 - notes: Semua permintaan khusus selain ordered_products. Jika pelanggan meminta rokok atau bawain sesuatu, atau layanan di luar delivery alkohol, jadikan notes serta tambahkan item "Nitip ke Jagoane Babe (Item)" dengan quantity 1, kecuali jika minta es batu, cup, atau stiker, maka tambahkan sebagai produk terpisah dengan tipe "Item" dan quantity sesuai permintaan.
 - PASTIKAN UNTUK MEMETAKAN INPUT KE TIPE "Item" JIKA ADA KURUNG BERTULISAN (Item) ATAU KE TIPE "Paket" JIKA ADA KURUNG BERTULISAN (Paket). Misal: "3 botol Atlas Lychee 600 mL (Item)" => tipe "Item", quantity 3, "4 paket Atlas Lychee 2 Botol Promo (Paket)" => tipe "Paket", quantity 4.
 
-- jenis_pengiriman: Jenis pengiriman, FD: free delivery, ID: instant delivery, EX: express. Nilai defaultnya "FD", jika tidak disebutkan. Jika FD, tambahkan Garansi ke dalam ordered_products. Jika ID, tambahkan "Instant Delivery (Paket)" ke dalam ordered_products quantity 1, tanpa Garansi. Jika EX, tambahkan "Express Delivery!! (Paket)" ke dalam ordered_products quantity 1, tanpa Garansi. 
+- jenis_pengiriman: Jenis pengiriman, FD: free delivery, I: instant delivery, EX: express. Nilai defaultnya "FD", jika tidak disebutkan. Jika FD, tambahkan Garansi ke dalam ordered_products. Jika I, tambahkan "Instant Delivery (Paket)" ke dalam ordered_products quantity 1, tanpa Garansi. Jika EX, tambahkan "Express Delivery!! (Paket)" ke dalam ordered_products quantity 1, tanpa Garansi. 
 - status: Status pembayaran, "Lunas" jika sudah bayar, "Pending" jika belum bayar. Nilai defaultnya "Lunas", jika tidak disebutkan.
+CATATAN PENTING: Garansi hanya boleh ada 1 kali dalam ordered_products, quantitynya juga harus 1 saja. Ini berlaku baik "Garansi" maupun "Babe Garansi-in!!!".
 
 3. Daftar tipe "Paket" tambahan:
-- Merch / Merh Babe / Polos XXX (XXX ini angka, misal "Merch Babe 1", "Merh Polos 2". Jadi jika pelanggan meminta "Merch Babe 2", maka tipe-nya adalah "Paket" dan produk-nya adalah "Merch Babe 2", quantity = 1, bukan "Merch Babe", quantity = 2)
+- Merch / Merh Babe / Polos XXX (XXX ini angka, misal "Merch Babe 1", "Merh Polos 2". Jadi jika pelanggan meminta "Merch Babe 2" (atau "Merch 2" ini artinya sama dengan "Merch Babe 2"), maka tipe-nya adalah "Paket" dan produk-nya adalah "Merch Babe 2", quantity = 1, bukan "Merch Babe", quantity = 2)
 - Babe Garansi-in!!! / Garansi
 - Tukar Kupon / Voucher
 - Komplimen XXX
@@ -109,14 +111,17 @@ Keterangan:
 5. Fallback: Jika format RECONFIRM JAJAN tidak sesuai atau ada data wajib yang hilang, kembalikan JSON berikut saja:
 {
   "fallback": "Ada data yang kurang atau format tidak sesuai. Pastikan format pesan:
+
 RECONFIRM JAJAN
-Nama: [Harus ada]
-Nomor Telepon: [Harus ada]
-Produk: [Harus ada, sertakan tipe Paket/Item]
-Alamat: [Harus ada]
-Payment: [Harus ada, BCA/BRI/Cash/QRIS/Hutang]
-Tuker Voucher: [Tidak wajib]
-Notes: [Tidak wajib]
+Nama: Arendra (Harus ada)
+Nomor Telepon: 08123456789 (Harus ada)
+Produk: Atlas Lychee 2 Botol Promo (Item/Paket, Harus ada, bisa lebih dari satu produk)
+Alamat: Jl. Ahmad Saleh No. 123, Jakarta (Harus ada)
+Payment: BCA (Harus ada, pilihannya BCA, BRI, Cash, QRIS, atau Hutang. Jika selain ini, anggap sebagai Cash)
+Tukar Voucher: Tumblr (Tidak wajib, jika tidak ada, kosongkan saja)
+Notes: Es Batu, Sticker 3 (Tidak wajib, jika tidak ada, kosongkan saja)
+Disc: 10% (Tidak wajib, jika tidak ada, kosongkan saja)
+Pengiriman: FD (Tidak wajib, default "FD", jika tidak disebutkan, pilihannya FD, I, EX)
 "
 
 6. Contoh:
@@ -335,7 +340,7 @@ Contoh input:
 RECONFIRM JAJAN
 Nama: Kevin
 Nomor Telepon: 085853605806
-Produk: 3 botol QRO anggur merah 650 ml (Item); Paket 3 AO Mild (Paket); 1 buah Paket 2 Anggur Hijau MCD + Kawa (Paket); Ongkir 10K (Item)
+Produk: 3 botol QRO anggur merah 650 ml (Item); Paket 3 AO Mild (Paket); 1 buah Paket 2 Anggur Hijau MCD + Kawa (Paket)
 Alamat: Jl. Melati No. 5, Bandung
 Disc: 10%
 Payment: BCA
@@ -368,12 +373,21 @@ class AgentBabe:
       df_product_dir: str = "./kulkasbabe.csv",
       df_combo_dir: str = "./paket.csv",
       top_k_retrieve: int = 5,
+      gmap_api_key: Optional[str] = None,
     ):
         self.instructions = instructions
-        self.model_name = model_name
+        self.model_name = {
+            "flash": "gemini-2.5-flash",
+            "pro": "gemini-2.5-pro",
+        }
         self.df_product_dir = df_product_dir
         self.df_combo_dir = df_combo_dir
         self.top_k_retrieve = top_k_retrieve
+        self.longlat_toko = (-7.560745951139057, 110.8493297202405)
+        self.gmap_api_key = gmap_api_key
+        self.free_areas = ["Gedongan", "Gedangan", "Gentan", "Kadilangu", "Kudu", "Kwarasan",
+                           "Langenharjo", "Madegondo", "Gonilan", "Gumpang", "Pabelan", "Blulukan",
+                           "Karangasem", "Baturan", "Gajahan", "Paulan"]
 
         self.product_df = pd.read_csv(self.df_product_dir)
         self.combo_df = pd.read_csv(self.df_combo_dir)
@@ -413,7 +427,7 @@ class AgentBabe:
         #######################
 
         LLM = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name=self.model_name['pro'],
             system_instruction=task_instruction,
         )
         idx = LLM.generate_content(f"Query: {query}, List: {sim_score_table}")
@@ -429,7 +443,7 @@ class AgentBabe:
     
     def reconfirm_translator(self, message):
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name=self.model_name['flash'],
             system_instruction=self.instructions['reconfirm_translator_prompt'],
         )
 
@@ -449,7 +463,8 @@ class AgentBabe:
         idx = self.select_id_by_agent(nama_produk, df, self.instructions['item_selection_prompt'], id_col='id', evaluation_col='name')
         if idx is None or idx == -99999:
             logger.error("Gagal menemukan produk item: %s", nama_produk)
-            return False, "Gagal menemukan produk item."
+            update_status(order_id, "X", access_token=access_token)
+            return False, f"Gagal menemukan produk item {nama_produk}, tolong masukkan dengan format <Nama produk> (<QTY> Paket/Item), dan hindari penggunaan singkatan (AI tidak tahu konteks dalam singkatan itu). Sebisa mungkin, sertakan juga brand-nya apa agar menghindari kesalahpahaman AI, misal AM bisa dianggap dari Mix Max Anggur Merah, QRO Anggur Merah, atau Kawa Kawa Anggur Merah, tapi kalau ini tidak dianggap masalah, silakan diabaikan. Jika error ini masih berlangsung, cek backoffice Olsera. Struk di-voidkan"
 
         df_sel = df[df['id'] == idx].reset_index(drop=True)
 
@@ -475,6 +490,7 @@ class AgentBabe:
             # Cek apakah ada key error
             if resp.get('error'):
                 logger.error("Error saat menambahkan item ke order: %s", resp['error']['message'])
+                update_status(order_id, "X", access_token=access_token)
                 return False, resp['error']['message']
             # Kalau perlu cek resp.status_code atau resp.json untuk deteksi error
             logger.debug("Response add_prod_to_order: %s", getattr(resp, 'text', ''))
@@ -482,7 +498,8 @@ class AgentBabe:
             return True, "Item berhasil ditambahkan ke order."
         except requests.exceptions.HTTPError as http_err:
             logger.error("HTTPError add item: %s", http_err)
-            return False, "Ada kesalahan HTTP saat memasukkan item ke order."
+            update_status(order_id, "X", access_token=access_token)
+            return False, "Ada kesalahan HTTP saat memasukkan item ke order. struk di-voidkan."
         except Exception as e:
             logger.error("Error lain add item: %s", e)
             return False, f"Ada kesalahan saat memasukkan item ke order. Error: {e}"
@@ -532,6 +549,11 @@ class AgentBabe:
         if paket_id is None:
             logger.error("select_id_by_agent gagal untuk paket: %s", nama_paket)
             return f"Gagal menemukan paket: {nama_paket}"
+
+        if paket_id == -99999:
+            logger.error("Tidak ada paket yang sesuai dengan nama: %s", nama_paket)
+            update_status(order_id, "X", access_token=access_token)
+            return f"Gagal menemukan paket yang sesuai: {nama_paket}, tolong masukkan dengan format <Nama produk> (<QTY> Paket/Item), dan hindari penggunaan singkatan (AI tidak tahu konteks dalam singkatan itu). Sebisa mungkin, sertakan juga brand-nya apa agar menghindari kesalahpahaman AI, misal AM bisa dianggap dari Mix Max Anggur Merah, QRO Anggur Merah, atau Kawa Kawa Anggur Merah, tapi kalau ini tidak dianggap masalah, silakan diabaikan. CONTOH: 2 Atlas Lychee + 2 Beer (1 Paket). Jika error ini masih berlangsung, cek backoffice Olsera. Struk di-voidkan."
 
         # Ambil detail paket
         try:
@@ -592,12 +614,17 @@ class AgentBabe:
 
             try:
                 resp = add_prod_to_order(order_id, idx, qty_total, access_token=access_token)
+                if resp is None:
+                    update_status(order_id, "X", access_token=access_token)
+                    return "Gagal menambahkan paket ke order, produk habis. Struk di-voidkan."
                 logger.debug("Response add paket-item: %s", getattr(resp, 'text', ''))
             except requests.exceptions.HTTPError as http_err:
                 logger.error("HTTPError add paket-item: %s", http_err)
-                return "Ada kesalahan HTTP saat memasukkan paket ke order."
+                update_status(order_id, "X", access_token=access_token)
+                return "Ada kesalahan HTTP saat memasukkan paket ke order. Struk di-voidkan."
             except Exception as e:
                 logger.error("Error lain add paket-item: %s", e)
+                update_status(order_id, "X", access_token=access_token)
                 return f"Ada kesalahan saat memasukkan paket ke order. Error: {e}"
             total_harga_normal += harga * qty_total
 
@@ -644,7 +671,12 @@ class AgentBabe:
                 return "Gagal update detail paket di order."
         return True
 
-    def handle_order(self, query: str, access_token: str, sudah_bayar: bool = False):
+    def handle_order(self, query: str, access_token_dir: str, sudah_bayar: bool = False):
+        with open(access_token_dir, "r") as file:
+            token_data = json.load(file)
+          
+        access_token = token_data.get("access_token", "")
+        
         logger.debug("Query diterima: %s", query)
         reconfirm_json = self.reconfirm_translator(query)
         logger.debug("Hasil reconfirm: %s", reconfirm_json)
@@ -657,18 +689,6 @@ class AgentBabe:
         
         if reconfirm_json.get('pembatalan'):
           print("[DEBUG] Pembatalan order dengan ID:", reconfirm_json['pembatalan'])
-
-          # Kalau bentuknya string (bisa angka, bisa list string)
-        #   if isinstance(reconfirm_json['pembatalan'], str):
-        #       try:
-        #           parsed = ast.literal_eval(reconfirm_json['pembatalan'])
-        #           reconfirm_json['pembatalan'] = parsed
-        #       except Exception:
-        #           # Kalau bukan list yang valid, asumsikan itu angka string
-        #           if reconfirm_json['pembatalan'].isdigit():
-        #               reconfirm_json['pembatalan'] = [reconfirm_json['pembatalan']]
-        #           else:
-        #               return "[ERROR] Format pembatalan tidak dikenali."
 
           # Kalau masih bukan list setelah semua itu, bungkus jadi list
           if not isinstance(reconfirm_json['pembatalan'], list):
@@ -687,23 +707,37 @@ class AgentBabe:
                   if stat_void:
                       print(f"Order {order_id} berhasil di-void.")
                   else:
-                      raise ValueError(f"Order {order_id} tidak ditemukan atau gagal di-void.")
+                      raise ValueError(f"Order {order_id} tidak ditemukan, kemungkinan order ini sudah di-void.")
               except requests.exceptions.HTTPError as http_err:
                   return f"Ada error dari Olsera API dalam membatalkan order {order_id}."
               except Exception as err:
-                  return f"Ada kesalahan dalam membatalkan order {order_id}: {err}. Struk di-voidkan."
+                  return f"Ada kesalahan dalam membatalkan order {order_id}: {err}"
 
           return f"Order dengan ID {', '.join(reconfirm_json['pembatalan'])} telah dibatalkan."
 
-        # gemini_model = genai.GenerativeModel(
-        #     model_name=self.model_name,
-        #     system_instruction=task_instructions['notes_prompt'],
-        # )
-        # notes = gemini_model.generate_content(query)
+        # Ubah alamat
+        try:
+            if reconfirm_json['address'][:4] == "http":
+                alamat_cust, longlat_cust, kelurahan, kecamatan, kota, provinsi = resolve_maps_shortlink(reconfirm_json['address'], api_key=self.gmap_api_key)
+                distance_and_time = get_travel_distance(self.longlat_toko, longlat_cust, api_key=self.gmap_api_key)
+                distance = distance_and_time['distance_meters'] / 1000
+                reconfirm_json['distance'] = distance
+            else:
+                longlat_cust = address_to_latlng(reconfirm_json['address'], api_key=self.gmap_api_key)
+                distance_and_time = get_travel_distance(self.longlat_toko, longlat_cust, api_key=self.gmap_api_key)
+                distance = distance_and_time['distance_meters'] / 1000
+                reconfirm_json['distance'] = distance
+            
+            if reconfirm_json['distance'] > 45:
+                logger.error("Jarak terlalu jauh: %s km", reconfirm_json['distance'])
+                return "Maaf, jarak pengiriman terlalu jauh. Silakan hubungi telemarketer untuk bantuan lebih lanjut."
+        except Exception as e:
+            logger.error("Gagal resolve alamat: %s", reconfirm_json['address'])
+            return f"Gagal mengonversi alamat. Pastikan format alamat dalam bentuk link: https://maps.app.goo.gl/XXX."
 
         try:
             gemini_model = genai.GenerativeModel(
-                model_name=self.model_name,
+                model_name=self.model_name["flash"],
                 system_instruction=task_instructions['notes_prompt'],
             )
             notes = gemini_model.generate_content(query)
@@ -713,31 +747,30 @@ class AgentBabe:
             logger.error("Gagal generate notes: %s", e)
             notes_text = ""
 
-        # cust_id, cust_telp = cek_kastamer(
-        #     nomor_telepon=reconfirm_json['phone_num'],
-        #     access_token=access_token
-        # )
-
         try:
             kastamer = cek_kastamer(
                 nomor_telepon=reconfirm_json['phone_num'],
                 access_token=access_token
             )
+            
+            cust_telp = reconfirm_json['phone_num']
+
+            if kastamer is None:
+                cust_id = None
+                cust_name = reconfirm_json['cust_name']
+            else:
+                cust_id = kastamer[0]
+                cust_name = kastamer[1]
+
         except Exception as e:
             logger.error("Gagal cek atau buat customer: %s", e)
             return "Gagal memproses data pelanggan."
 
-        cust_telp = reconfirm_json['phone_num']
-        if kastamer is None:
-            cust_id = None
-            cust_name = reconfirm_json['cust_name']
-        else:
-            cust_id = kastamer[0]
-            cust_name = kastamer[1]
-
         # Create order
         today_str = datetime.now().strftime('%Y-%m-%d')
         try:
+            print("Membuat order baru...")
+            print(cust_id, cust_name, cust_telp)
             order_id, order_no = create_order(
                 order_date=today_str,
                 customer_id=cust_id,
@@ -751,7 +784,30 @@ class AgentBabe:
         except Exception as e:
             logger.error("Gagal membuat order: %s", e)
             return "Terjadi kesalahan, gagal membuat order baru. Mohon coba lagi."
-            
+        
+        subsidi_ongkir = is_free_delivery(alamat_cust, self.free_areas)
+        ongkir = distance_cost_rule(reconfirm_json['distance'], subsidi_ongkir[0])
+        # Add Ongkir
+        if ongkir != "Gratis Ongkir" and ongkir != "Subsidi Ongkir 10K":
+            reconfirm_json['ordered_products'].append(
+                {
+                    'tipe': 'Item',
+                    'produk': distance_cost_rule(reconfirm_json['distance']),
+                    'quantity': 1,
+                }
+            )
+
+        elif ongkir == "Subsidi Ongkir 10K":
+            reconfirm_json['ordered_products'].append(
+                {
+                    'tipe': 'Item',
+                    'produk': "Subsidi Ongkir 10K",
+                    'quantity': 1,
+                }
+            )
+        
+        else:
+            pass
 
         # print(reconfirm_json)
         print("PESANAN RECONFIRM")
@@ -794,13 +850,40 @@ class AgentBabe:
                 continue
         
         # Tambahkan diskon
-        self.add_discount(order_id, mode=reconfirm_json['mode_diskon'], access_token=access_token, discount=reconfirm_json['disc'], notes="")
+        try:
+            self.add_discount(order_id, mode=reconfirm_json['mode_diskon'], access_token=access_token, discount=reconfirm_json['disc'], notes="")
+        
+        except Exception as e:
+            logger.error("Gagal menambahkan diskon: %s", e)
+            update_status(order_id, "X", access_token)
+            return "Ada kesalahan saat menambahkan diskon. Mohon coba kirim ulang, sementara struk di voidkan."
 
+        # Retrieve order details after adding products
         try:
             order_details = fetch_order_details(order_id, access_token)
+
         except Exception as e:
             logger.error("Gagal fetch detail order setelah tambah produk: %s", e)
             return "Gagal mengambil detail order."
+        
+        # Auto add merch
+        total_amount = int(float(order_details['data']['total_amount']))
+        if total_amount < 100000:
+            self._process_item(order_id, "Cup Babe", 1, access_token)
+        
+        else:
+            self._process_item(order_id, "Cup Babe", 2, access_token)
+        
+        if total_amount > 150000 and total_amount < 250000:
+            self._process_paket(order_id, "Merch Babe 1", 1, access_token)
+        
+        elif total_amount >= 250000:
+            self._process_paket(order_id, "Merch Babe 2", 1, access_token)
+        
+        else:
+            pass
+
+        # Proses pembayaran
         status = reconfirm_json.get('status', '').lower()
         if sudah_bayar or status == 'lunas':
             try:
@@ -814,7 +897,7 @@ class AgentBabe:
                     # lanjutkan tanpa bayar atau return error?
                 else:
                     payment_id = payment_modes[idx]['id']
-                    total_amount = int(float(order_details['data']['total_amount']))
+                    # total_amount = int(float(order_details['data']['total_amount']))
                     update_payment(
                         order_id=order_id,
                         payment_amount=str(total_amount),
@@ -840,8 +923,21 @@ class AgentBabe:
 
         # 9. Buat invoice teks
         pending_line = "*PENDING ORDER*\n" if status != 'lunas' else ""
-        max_luncur = (datetime.now() + timedelta(minutes=35)).strftime('%H:%M')
-        max_luncur_line = f"MAKSIMAL DILUNCURKAN DARI GUDANG: {max_luncur}" if reconfirm_json.get('jenis_pengiriman') == 'FD' else ""
+
+        # if reconfirm_json.get('jenis_pengiriman') == 'FD':
+        #     max_luncur = (datetime.now() + timedelta(minutes=35)).strftime('%H:%M')
+        # elif reconfirm_json.get('jenis_pengiriman') == 'I':
+        #     max_luncur = (datetime.now() + timedelta(minutes=25)).strftime('%H:%M')
+        # elif reconfirm_json.get('jenis_pengiriman') == 'EX':
+        #     max_luncur = (datetime.now() + timedelta(minutes=20)).strftime('%H:%M')
+
+        try:
+            max_luncur = estimasi_tiba(reconfirm_json['distance'], reconfirm_json['jenis_pengiriman'], datetime.now())
+        except Exception as e:
+            max_luncur_menit = int(distance_and_time['duration_seconds'] / 60) + 20
+            max_luncur = (datetime.now() + timedelta(minutes=max_luncur_menit)).strftime('%H:%M')
+
+        max_luncur_line = f"MAKSIMAL DILUNCURKAN DARI GUDANG: {max_luncur}" if reconfirm_json['jenis_pengiriman'] == 'FD' else f"ESTIMASI SAMPAI: {max_luncur}"
 
         total_ftotal = order_details['data'].get('ftotal_amount', '')
         invoice_lines = [
@@ -852,12 +948,14 @@ class AgentBabe:
             "",
             "",
             max_luncur_line.strip(),
-            "Jarak: XXX km",
+            f"Jarak: {reconfirm_json['distance']:.1f} km ({kelurahan}, {kecamatan.replace('Kecamatan ', '').replace('Kec. ', '').replace('kecamatan', '').replace('kec.', '')})",
             "",
             "",
             "Makasih yaa Cah udah Jajan di Babe!",
             f"Total Jajan: {total_ftotal}",
             f"Cek Jajanmu di sini: {struk_url or 'Gagal mencetak struk. Tolong ulangi.'}",
+            "",
+            "",
             f"Jenis Pengiriman: {reconfirm_json.get('jenis_pengiriman', '')}",
             f"*NOTES: {reconfirm_json.get('notes') or 'Tidak ada catatan tambahan.'}*",
         ]
