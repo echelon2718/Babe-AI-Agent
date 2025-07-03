@@ -8,10 +8,12 @@ import pandas as pd
 import requests
 import ast
 from modules.crud_utility import add_prod_to_order, update_payment, fetch_product_combo_details, fetch_order_details, update_order_detail, cek_kastamer, create_order, list_payment_modes, update_status, cetak_struk, fetch_product_item_details, update_order_attr, void_order
-from modules.maps_utility import resolve_maps_shortlink, get_travel_distance, address_to_latlng, distance_cost_rule, is_free_delivery, estimasi_tiba
+from modules.maps_utility import resolve_maps_shortlink, get_travel_distance, get_fastest_route_details, address_to_latlng, distance_cost_rule, is_free_delivery, estimasi_tiba
 from datetime import datetime, timedelta
 import logging
 from typing import Optional, Tuple, Dict, Any
+import time
+from collections import defaultdict
 
 nltk.download('punkt')
 nltk.download('punkt_tab')
@@ -53,7 +55,7 @@ Tapi pastikan ada IDnya, jika tidak ada ID, kembalikan pesan dengan format:
     "fallback": "Tidak ada ID yang diberikan untuk pembatalan."
 }
 
-2. Output harus berupa JSON valid, dengan struktur dan aturan berikut:
+2. Output harus berupa JSON valid (HARUS JSON!!!!!), dengan struktur dan aturan berikut:
 
 {
   "cust_name": <str>,
@@ -163,7 +165,7 @@ Contoh Output JSON BENAR:
     },
     {
       "tipe": "Paket",
-      "produk": "Tuker Voucher: Tumblr",
+      "produk": "Tukar Voucher Tumblr",
       "quantity": 1
     },
     {
@@ -212,7 +214,7 @@ Contoh Output JSON SALAH (fallback):
     },
     {
       "tipe": "Paket",
-      "produk": "Tuker Voucher: Tumblr",
+      "produk": "Tukar Voucher Tumblr",
       "quantity": 1
     },
     {
@@ -236,6 +238,7 @@ CATATAN DISKON TAMBAHAN:
 - Diskon Media Partner: 100%
 - Diskon Ngacara: 100%
 - Diskon RND: 100%
+- Redeem Free Instant: Ini bukan diskon, tapi jika ada prompt seperti ini, gantikan item delivery apapun (baik FD, I, maupun EX) dengan "Free Instant Delivery! (Item)" dengan quantity 1, dan gantikan jenis_pengiriman jadi I. Jangan tambahkan diskon apapun.
 '''
 
 item_selection_prompt = '''
@@ -427,7 +430,7 @@ class AgentBabe:
         #######################
 
         LLM = genai.GenerativeModel(
-            model_name=self.model_name['pro'],
+            model_name=self.model_name['flash'],
             system_instruction=task_instruction,
         )
         idx = LLM.generate_content(f"Query: {query}, List: {sim_score_table}")
@@ -448,7 +451,11 @@ class AgentBabe:
         )
 
         gemini_ans = model.generate_content(message)
-        sanitized_response = self.clean_llm_json_output(gemini_ans.text)
+        try:
+            sanitized_response = self.clean_llm_json_output(gemini_ans.text)
+        except Exception as e:
+            logger.error("Gagal membersihkan output JSON dari Gemini: %s", e)
+            return {"fallback": "Ada kesalahan dalam mem-parsing output dari AI. Silakan coba lagi dan pastikan formatnya sesuai."}
 
         return sanitized_response
 
@@ -457,6 +464,7 @@ class AgentBabe:
         order_id: str,
         nama_produk: str,
         qty: int,
+        cart: list,
         access_token: str,
     ):
         df = self.product_df[self.product_df['pos_hidden'] == 0]
@@ -467,6 +475,11 @@ class AgentBabe:
             return False, f"Gagal menemukan produk item {nama_produk}, tolong masukkan dengan format <Nama produk> (<QTY> Paket/Item), dan hindari penggunaan singkatan (AI tidak tahu konteks dalam singkatan itu). Sebisa mungkin, sertakan juga brand-nya apa agar menghindari kesalahpahaman AI, misal AM bisa dianggap dari Mix Max Anggur Merah, QRO Anggur Merah, atau Kawa Kawa Anggur Merah, tapi kalau ini tidak dianggap masalah, silakan diabaikan. Jika error ini masih berlangsung, cek backoffice Olsera. Struk di-voidkan"
 
         df_sel = df[df['id'] == idx].reset_index(drop=True)
+
+        if df_sel.empty:
+            logger.error("Data produk dengan id %s tidak ditemukan dalam df.", idx)
+            update_status(order_id, "X", access_token=access_token)
+            return False, f"Produk dengan id {idx} tidak ditemukan. Mungkin terjadi perubahan pada database atau item sudah tidak tersedia."
 
         if df_sel.at[0, 'variants'] != '[]':
             try:
@@ -480,31 +493,49 @@ class AgentBabe:
                 sel = variants_ready[variants_ready['name'].str.startswith(prefix)]
                 if not sel.empty:
                     variant_id = sel['id'].iloc[0]
-                    idx = f"{idx}|{variant_id}"
-                    logger.debug("Varian dipilih untuk item %s: %s", nama_produk, idx)
+                    prodvar_id = f"{idx}|{variant_id}"
+                    logger.debug("Varian dipilih untuk item %s: %s", nama_produk, prodvar_id)
                     break
         
-        # Tambah ke order
-        try:
-            resp = add_prod_to_order(order_id, idx, qty, access_token=access_token)
-            # Cek apakah ada key error
-            if resp.get('error'):
-                logger.error("Error saat menambahkan item ke order: %s", resp['error']['message'])
-                update_status(order_id, "X", access_token=access_token)
-                return False, resp['error']['message']
-            # Kalau perlu cek resp.status_code atau resp.json untuk deteksi error
-            logger.debug("Response add_prod_to_order: %s", getattr(resp, 'text', ''))
-            print(f"ITEM  {df_sel['name'].iloc[0]:<45} {idx:<15} {qty:<15}")
-            return True, "Item berhasil ditambahkan ke order."
-        except requests.exceptions.HTTPError as http_err:
-            logger.error("HTTPError add item: %s", http_err)
-            update_status(order_id, "X", access_token=access_token)
-            return False, "Ada kesalahan HTTP saat memasukkan item ke order. struk di-voidkan."
-        except Exception as e:
-            logger.error("Error lain add item: %s", e)
-            return False, f"Ada kesalahan saat memasukkan item ke order. Error: {e}"
+        cart.append({
+            "prod_id": idx,
+            "prodvar_id": prodvar_id if 'prodvar_id' in locals() else idx,
+            "name": nama_produk,
+            "qty": qty,
+            "price": fetch_product_item_details(idx, access_token=access_token).get('data', {})['sell_price_pos'],
+            "disc": 0,
+        })
+
+        return True, f"Item {nama_produk} berhasil ditambahkan ke order dengan ID {order_id}."
+
+        # Tambah ke order ------- DIMATIKAN SEMENTARA UNTUK DEBUGGING
+        # try:
+        #     resp = add_prod_to_order(order_id, idx, qty, access_token=access_token)
+        #     # Cek apakah ada key error
+        #     if resp.get('error'):
+        #         logger.error("Error saat menambahkan item ke order: %s", resp['error']['message'])
+        #         update_status(order_id, "X", access_token=access_token)
+        #         return False, resp['error']['message']
+        #     # Kalau perlu cek resp.status_code atau resp.json untuk deteksi error
+        #     logger.debug("Response add_prod_to_order: %s", getattr(resp, 'text', ''))
+        #     print(f"ITEM  {df_sel['name'].iloc[0]:<45} {idx:<15} {qty:<15}")
+        #     return True, "Item berhasil ditambahkan ke order."
+        # except requests.exceptions.HTTPError as http_err:
+        #     logger.error("HTTPError add item: %s", http_err)
+        #     update_status(order_id, "X", access_token=access_token)
+        #     return False, "Ada kesalahan HTTP saat memasukkan item ke order. struk di-voidkan."
+        # except Exception as e:
+        #     logger.error("Error lain add item: %s", e)
+        #     return False, f"Ada kesalahan saat memasukkan item ke order. Error: {e}"
     
-    def _process_paket(self, order_id: Any, nama_paket: str, qty_pesan: int, access_token: str) -> Any:
+    def _process_paket(
+        self, 
+        order_id: Any, 
+        nama_paket: str, 
+        qty_pesan: int, 
+        cart: list,
+        access_token: str
+    ):
         """
         Proses paket: cari ID paket, fetch detail, tambahkan tiap item dalam paket,
         lalu update diskon tiap item. 
@@ -563,7 +594,9 @@ class AgentBabe:
             logger.error("Gagal fetch combo details untuk %s: %s", paket_id, e)
             return "Gagal ambil detail paket."
 
+        # Hitung total harga normal untuk diskon
         total_harga_normal = 0.0
+
         # Tambah tiap item
         for item in combo_items:
             product_id = item.get('product_id')
@@ -575,7 +608,7 @@ class AgentBabe:
                 data = item_details.get('data', {})
             except Exception as e:
                 logger.error("Gagal fetch item_details ID %s: %s", product_id, e)
-                return f"Gagal ambil data produk {product_id}."
+                return f"Gagal ambil data produk {product_id}. Detail error: {e}"
             # Cek variant dan harga
             if not data.get('variant'):
                 idx = f"{product_id}"
@@ -610,58 +643,167 @@ class AgentBabe:
                 idx = f"{product_id}|{chosen_variant_id}"
             # Tambah ke order
             logger.debug("Menambahkan paket-item: %s, qty: %s", idx, qty_total)
+
+            cart.append({
+                "prod_id": product_id,
+                "prodvar_id": idx,
+                "name": item['product_name'],
+                "qty": qty_total,
+                "price": fetch_product_item_details(product_id, access_token=access_token).get('data', {})['sell_price_pos'],
+                "disc": 0,
+            })
+
             print(f"PAKET {item['product_name']:<45} {idx:<15} {qty_total:<15}")
 
-            try:
-                resp = add_prod_to_order(order_id, idx, qty_total, access_token=access_token)
-                if resp is None:
-                    update_status(order_id, "X", access_token=access_token)
-                    return "Gagal menambahkan paket ke order, produk habis. Struk di-voidkan."
-                logger.debug("Response add paket-item: %s", getattr(resp, 'text', ''))
-            except requests.exceptions.HTTPError as http_err:
-                logger.error("HTTPError add paket-item: %s", http_err)
-                update_status(order_id, "X", access_token=access_token)
-                return "Ada kesalahan HTTP saat memasukkan paket ke order. Struk di-voidkan."
-            except Exception as e:
-                logger.error("Error lain add paket-item: %s", e)
-                update_status(order_id, "X", access_token=access_token)
-                return f"Ada kesalahan saat memasukkan paket ke order. Error: {e}"
+            # try:
+            #     resp = add_prod_to_order(order_id, idx, qty_total, access_token=access_token)
+            #     if resp is None:
+            #         update_status(order_id, "X", access_token=access_token)
+            #         return "Gagal menambahkan paket ke order, produk habis. Struk di-voidkan."
+            #     logger.debug("Response add paket-item: %s", getattr(resp, 'text', ''))
+            # except requests.exceptions.HTTPError as http_err:
+            #     logger.error("HTTPError add paket-item: %s", http_err)
+            #     update_status(order_id, "X", access_token=access_token)
+            #     return "Ada kesalahan HTTP saat memasukkan paket ke order. Struk di-voidkan."
+            # except Exception as e:
+            #     logger.error("Error lain add paket-item: %s", e)
+            #     update_status(order_id, "X", access_token=access_token)
+            #     return f"Ada kesalahan saat memasukkan paket ke order. Error: {e}"
             total_harga_normal += harga * qty_total
 
-        # Setelah semua ditambahkan, update diskon tiap item
+        ############## PATCH: Diskon untuk paket lewat Cart ##############
+        bundle_entry = cart[-len(combo_items):]  # Ambil entry terakhir yang merupakan paket
+        harga_paket = float(combo_details['data']['sell_price_pos']) * qty_pesan
+
+        for item in bundle_entry:
+            price = float(item['price'])
+            item['disc'] = price * (total_harga_normal - harga_paket) / total_harga_normal * float(item['qty']) if total_harga_normal > 0 else 0.0
+            logger.debug("Paket-item %s diskon: %s", item['name'], item['disc'])
+
+
+        # Setelah semua ditambahkan, update diskon tiap item --- DIMATIKAN SEMENTARA UNTUK DEBUGGING
+        # try:
+        #     ord_detail = fetch_order_details(order_id=order_id, access_token=access_token)
+        #     paket_items_added = ord_detail['data']['orderitems'][-len(combo_items):]
+        #     harga_promo = float(combo_details['data']['sell_price_pos']) * qty_pesan
+        # except Exception as e:
+        #     logger.error("Gagal fetch detail order untuk update diskon: %s", e)
+        #     return "Gagal update diskon paket."
+        # # Hitung dan update tiap item
+        # for item in paket_items_added:
+        #     item_id = item['id']
+        #     item_qty = item['qty']
+        #     try:
+        #         item_price = float(item['amount'])
+        #         # Hindari ZeroDivisionError
+        #         if total_harga_normal > 0:
+        #             item_disc = item_price * ((total_harga_normal - harga_promo) / total_harga_normal)
+        #         else:
+        #             item_disc = 0.0
+        #     except Exception:
+        #         item_disc = 0.0
+        #     # Ambil fprice bersih angka
+        #     try:
+        #         fprice_str = item.get('fprice', '').replace('.', '')
+        #         price_int = int(float(fprice_str)) if fprice_str else 0
+        #     except Exception:
+        #         price_int = 0
+        #     logger.debug("Update detail order item_id=%s, disc=%s, price=%s", item_id, item_disc, price_int)
+        #     try:
+        #         update_order_detail(
+        #             order_id=str(order_id),
+        #             id=str(item_id),
+        #             disc=str(item_disc),
+        #             price=str(price_int),
+        #             qty=str(item_qty),
+        #             note="Promo Paket",
+        #             access_token=access_token
+        #         )
+        #     except Exception as e:
+        #         logger.error("Gagal update_order_detail untuk item_id %s: %s", item_id, e)
+        #         return "Gagal update detail paket di order."
+        return True
+
+    def aggregate_cart_by_prodvar(self, cart: list) -> list:
+        # Aggregation by prodvar_id
+        agg_by_prodvar = defaultdict(lambda: {'prodvar_id': None, 'name': None, 'qty': 0, 'disc': 0.0})
+
+        for item in cart:
+            pvar = str(item['prodvar_id'])
+            if agg_by_prodvar[pvar]['prodvar_id'] is None:
+                agg_by_prodvar[pvar]['prodvar_id'] = pvar
+                agg_by_prodvar[pvar]['name'] = item['name']
+            agg_by_prodvar[pvar]['qty'] += item['qty']
+            agg_by_prodvar[pvar]['disc'] += float(item['disc'])
+
+        # Convert to list and display
+        aggregated_by_prodvar = list(agg_by_prodvar.values())
+        return aggregated_by_prodvar
+
+    def move_cart_to_order(self, cart: list, order_id: str, access_token: str):
+        """
+        Pindahkan semua item dalam cart ke order dengan ID order_id.
+        Mengembalikan True jika sukses, atau string pesan error jika gagal.
+        """
+        if not cart:
+            logger.error("Cart kosong, tidak ada item untuk dipindahkan.")
+            return "Cart kosong, tidak ada item untuk dipindahkan."
+
+        for item in cart:
+            prodvar_id = item['prodvar_id']
+            qty = item['qty']
+            try:
+                resp = add_prod_to_order(order_id, prodvar_id, qty, access_token=access_token)
+                if resp is None:
+                    update_status(order_id, "X", access_token=access_token)
+                    return "Gagal menambahkan produk ke order, produk habis. Struk di-voidkan."
+                logger.debug("Response add_prod_to_order: %s", getattr(resp, 'text', ''))
+            except requests.exceptions.HTTPError as http_err:
+                logger.error("HTTPError saat menambahkan produk ke order: %s", http_err)
+                update_status(order_id, "X", access_token=access_token)
+                return "Ada kesalahan HTTP saat memasukkan produk ke order. Struk di-voidkan."
+            except Exception as e:
+                logger.error("Error lain saat menambahkan produk ke order: %s", e)
+                update_status(order_id, "X", access_token=access_token)
+                return f"Ada kesalahan saat memasukkan produk ke order. Error: {e}"
+        
+        # Setelah itu, tambahkan diskon untuk tiap item
         try:
             ord_detail = fetch_order_details(order_id=order_id, access_token=access_token)
-            paket_items_added = ord_detail['data']['orderitems'][-len(combo_items):]
-            harga_promo = float(combo_details['data']['sell_price_pos']) * qty_pesan
+            paket_items = ord_detail['data']['orderitems']
+            # paket_items = pd.DataFrame(paket_items)
         except Exception as e:
             logger.error("Gagal fetch detail order untuk update diskon: %s", e)
             return "Gagal update diskon paket."
+        
         # Hitung dan update tiap item
-        for item in paket_items_added:
+        for idx, item in enumerate(paket_items):
             item_id = item['id']
             item_qty = item['qty']
-            try:
-                item_price = float(item['amount'])
+            item_disc = cart[idx]['disc'] if idx < len(cart) else 0.0
+            item_price = int(float(item.get('fprice', 0).replace('.', '')))
+            # try:
+                # item_price = float(item['amount'])
                 # Hindari ZeroDivisionError
-                if total_harga_normal > 0:
-                    item_disc = item_price * ((total_harga_normal - harga_promo) / total_harga_normal)
-                else:
-                    item_disc = 0.0
-            except Exception:
-                item_disc = 0.0
-            # Ambil fprice bersih angka
-            try:
-                fprice_str = item.get('fprice', '').replace('.', '')
-                price_int = int(float(fprice_str)) if fprice_str else 0
-            except Exception:
-                price_int = 0
-            logger.debug("Update detail order item_id=%s, disc=%s, price=%s", item_id, item_disc, price_int)
+                # if total_harga_normal > 0:
+                    # item_disc = item_price * ((total_harga_normal - harga_promo) / total_harga_normal)
+        #         else:
+        #             item_disc = 0.0
+        #     except Exception:
+        #         item_disc = 0.0
+        #     # Ambil fprice bersih angka
+        #     try:
+        #         fprice_str = item.get('fprice', '').replace('.', '')
+        #         price_int = int(float(fprice_str)) if fprice_str else 0
+        #     except Exception:
+        #         price_int = 0
+        #     logger.debug("Update detail order item_id=%s, disc=%s, price=%s", item_id, item_disc, price_int)
             try:
                 update_order_detail(
                     order_id=str(order_id),
                     id=str(item_id),
                     disc=str(item_disc),
-                    price=str(price_int),
+                    price=str(item_price),
                     qty=str(item_qty),
                     note="Promo Paket",
                     access_token=access_token
@@ -688,43 +830,60 @@ class AgentBabe:
             return reconfirm_json['fallback']
         
         if reconfirm_json.get('pembatalan'):
-          print("[DEBUG] Pembatalan order dengan ID:", reconfirm_json['pembatalan'])
+            print("[DEBUG] Pembatalan order dengan ID:", reconfirm_json['pembatalan'])
 
-          # Kalau masih bukan list setelah semua itu, bungkus jadi list
-          if not isinstance(reconfirm_json['pembatalan'], list):
-              reconfirm_json['pembatalan'] = [str(reconfirm_json['pembatalan'])]
+            # Kalau masih bukan list setelah semua itu, bungkus jadi list
+            if not isinstance(reconfirm_json['pembatalan'], list):
+                reconfirm_json['pembatalan'] = [str(reconfirm_json['pembatalan'])]
 
-          # Cek apakah list-nya kosong
-          if not reconfirm_json['pembatalan']:
-              print("[ERROR] Tidak ada ID yang diberikan untuk pembatalan.")
-              return "Tidak ada ID yang diberikan untuk pembatalan."
+                try:
+                    joined = ','.join(reconfirm_json['pembatalan'])
+                    reconfirm_json['pembatalan'] = [x.strip() for x in joined.split(',') if x.strip()]
+                except ValueError:
+                    print("Split sudah dicoba")
+                    pass
 
-          # Batalkan order
-          for order_id in reconfirm_json['pembatalan']:
-              try:
-                #   update_status(order_id, "X", access_token)
-                  stat_void = void_order(order_id, access_token)
-                  if stat_void:
-                      print(f"Order {order_id} berhasil di-void.")
-                  else:
-                      raise ValueError(f"Order {order_id} tidak ditemukan, kemungkinan order ini sudah di-void.")
-              except requests.exceptions.HTTPError as http_err:
-                  return f"Ada error dari Olsera API dalam membatalkan order {order_id}."
-              except Exception as err:
-                  return f"Ada kesalahan dalam membatalkan order {order_id}: {err}"
+            # Cek apakah list-nya kosong
+            if not reconfirm_json['pembatalan']:
+                print("[ERROR] Tidak ada ID yang diberikan untuk pembatalan.")
+                return "Tidak ada ID yang diberikan untuk pembatalan."
 
-          return f"Order dengan ID {', '.join(reconfirm_json['pembatalan'])} telah dibatalkan."
+            # Batalkan order
+            fail_messages = []
+            for order_id in reconfirm_json['pembatalan']:
+                try:
+                    #   update_status(order_id, "X", access_token)
+                    stat_void = void_order(order_id, access_token)
+                    if stat_void:
+                        print(f"Order {order_id} berhasil di-void.")
+                    else:
+                        raise ValueError(f"Order {order_id} tidak ditemukan, kemungkinan order ini sudah di-void.")
+                except requests.exceptions.HTTPError as http_err:
+                    fail_messages.append(f"Gagal menghubungi API Olsera untuk membatalkan order {order_id}.")
+                    continue
+                except Exception as err:
+                    fail_messages.append(f"Ada kesalahan dalam membatalkan order {order_id}: {err}")
+                    continue
+        
+            if len(fail_messages) > 0:
+                return "Gagal membatalkan beberapa order:\n{} Selain itu berhasil.".format('\n'.join(fail_messages))
+            else:
+                return f"Order dengan ID {', '.join(reconfirm_json['pembatalan'])} telah dibatalkan."
 
         # Ubah alamat
         try:
             if reconfirm_json['address'][:4] == "http":
                 alamat_cust, longlat_cust, kelurahan, kecamatan, kota, provinsi = resolve_maps_shortlink(reconfirm_json['address'], api_key=self.gmap_api_key)
                 distance_and_time = get_travel_distance(self.longlat_toko, longlat_cust, api_key=self.gmap_api_key)
+                # distance_and_time = get_fastest_route_details(self.longlat_toko, longlat_cust, api_key=self.gmap_api_key)
                 distance = distance_and_time['distance_meters'] / 1000
                 reconfirm_json['distance'] = distance
             else:
+                alamat_cust = reconfirm_json['address']
+                kelurahan, kecamatan, kota, provinsi = None, None, None, #Temporarily set to None
                 longlat_cust = address_to_latlng(reconfirm_json['address'], api_key=self.gmap_api_key)
                 distance_and_time = get_travel_distance(self.longlat_toko, longlat_cust, api_key=self.gmap_api_key)
+                # distance_and_time = get_fastest_route_details(self.longlat_toko, longlat_cust, api_key=self.gmap_api_key)
                 distance = distance_and_time['distance_meters'] / 1000
                 reconfirm_json['distance'] = distance
             
@@ -733,8 +892,9 @@ class AgentBabe:
                 return "Maaf, jarak pengiriman terlalu jauh. Silakan hubungi telemarketer untuk bantuan lebih lanjut."
         except Exception as e:
             logger.error("Gagal resolve alamat: %s", reconfirm_json['address'])
-            return f"Gagal mengonversi alamat. Pastikan format alamat dalam bentuk link: https://maps.app.goo.gl/XXX."
+            return f"Gagal mengonversi alamat. Pastikan format alamat dalam bentuk link: https://maps.app.goo.gl/XXX. Error {e}"
 
+        # Buat notes
         try:
             gemini_model = genai.GenerativeModel(
                 model_name=self.model_name["flash"],
@@ -764,7 +924,7 @@ class AgentBabe:
 
         except Exception as e:
             logger.error("Gagal cek atau buat customer: %s", e)
-            return "Gagal memproses data pelanggan."
+            return f"Gagal memproses data pelanggan. Error: {e}"
 
         # Create order
         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -783,10 +943,11 @@ class AgentBabe:
             print(f"Order ID: {order_id}, Order No: {order_no}")
         except Exception as e:
             logger.error("Gagal membuat order: %s", e)
-            return "Terjadi kesalahan, gagal membuat order baru. Mohon coba lagi."
+            return f"Terjadi kesalahan, gagal membuat order baru. Mohon coba lagi. Error: {e}"
         
         subsidi_ongkir = is_free_delivery(alamat_cust, self.free_areas)
         ongkir = distance_cost_rule(reconfirm_json['distance'], subsidi_ongkir[0])
+
         # Add Ongkir
         if ongkir != "Gratis Ongkir" and ongkir != "Subsidi Ongkir 10K":
             reconfirm_json['ordered_products'].append(
@@ -818,6 +979,9 @@ class AgentBabe:
         print(f"{'JENIS':<5} {'BARANG':<45} {'ID':<20} {'QTY':<10}")
         print("-" * 75)
 
+        ############## SIAPKAN KERANJANG SEMENTARA #####################
+        cart_temp = []
+
         # Add products to order
         ordered_products = reconfirm_json.get('ordered_products', [])
         for product in ordered_products:
@@ -831,7 +995,8 @@ class AgentBabe:
                 continue
 
             if tipe == 'item':
-                success, msg = self._process_item(order_id, nama_produk, qty, access_token)
+                success, msg = self._process_item(order_id, nama_produk, qty, cart_temp, access_token)
+                time.sleep(1)  # Delay untuk menghindari rate limit API Olsera
 
                 if not success:
                     # Jika error di dalam, void entire order dan return
@@ -839,7 +1004,8 @@ class AgentBabe:
                     return f"Ada kesalahan saat menambahkan item, struk di-void. Error: {msg}"
 
             elif tipe == 'paket':
-                success_or_msg = self._process_paket(order_id, nama_produk, qty, access_token)
+                success_or_msg = self._process_paket(order_id, nama_produk, qty, cart_temp, access_token)
+                time
                 if success_or_msg is not True:
                     # Jika mengembalikan string pesan error, batalkan order
                     update_status(order_id, "X", access_token)
@@ -849,41 +1015,51 @@ class AgentBabe:
                 print(f"[ERROR] Jenis tidak dikenali. Pastikan untuk memasukkan produk dengan kurung () yang menjelaskan jenis produk, apakah item atau paket. Misal: Hennesey 650 mL (item). Anda memasukkan: {product['tipe']}")
                 continue
         
-        # Tambahkan diskon
-        try:
-            self.add_discount(order_id, mode=reconfirm_json['mode_diskon'], access_token=access_token, discount=reconfirm_json['disc'], notes="")
-        
-        except Exception as e:
-            logger.error("Gagal menambahkan diskon: %s", e)
-            update_status(order_id, "X", access_token)
-            return "Ada kesalahan saat menambahkan diskon. Mohon coba kirim ulang, sementara struk di voidkan."
-
-        # Retrieve order details after adding products
-        try:
-            order_details = fetch_order_details(order_id, access_token)
-
-        except Exception as e:
-            logger.error("Gagal fetch detail order setelah tambah produk: %s", e)
-            return "Gagal mengambil detail order."
-        
         # Auto add merch
-        total_amount = int(float(order_details['data']['total_amount']))
+        # total_amount = int(float(order_details['data']['total_amount']))
+        cart_df = pd.DataFrame(cart_temp)
+        total_amount = cart_df['price'].astype(float).sum() if not cart_df.empty else 0
+
         if total_amount < 100000:
-            self._process_item(order_id, "Cup Babe", 1, access_token)
+            self._process_item(order_id, "Cup Babe", 1, cart_temp, access_token)
+            time.sleep(1)  # Delay untuk menghindari rate limit API Olsera
         
         else:
-            self._process_item(order_id, "Cup Babe", 2, access_token)
+            self._process_item(order_id, "Cup Babe", 2, cart_temp, access_token)
+            time.sleep(1)  # Delay untuk menghindari rate limit API Olsera
         
         if total_amount > 150000 and total_amount < 250000:
-            self._process_paket(order_id, "Merch Babe 1", 1, access_token)
+            self._process_paket(order_id, "Merch Babe 1", 1, cart_temp, access_token)
+            time.sleep(1)  # Delay untuk menghindari rate limit API Olsera
         
         elif total_amount >= 250000:
-            self._process_paket(order_id, "Merch Babe 2", 1, access_token)
+            self._process_paket(order_id, "Merch Babe 2", 1, cart_temp, access_token)
+            time.sleep(1)  # Delay untuk menghindari rate limit API Olsera
         
         else:
             pass
 
-        # Proses pembayaran
+        agg_cart = self.aggregate_cart_by_prodvar(cart_temp)
+        self.move_cart_to_order(agg_cart, order_id, access_token)
+
+        # Tambahkan diskon --- DIMATIKAN SEMENTARA UNTUK DEBUGGING
+        try:
+            self.add_discount(order_id, mode=reconfirm_json['mode_diskon'], access_token=access_token, discount=reconfirm_json['disc'], notes="")
+        except Exception as e:
+            logger.error("Gagal menambahkan diskon: %s", e)
+            update_status(order_id, "X", access_token)
+            return f"Ada kesalahan saat menambahkan diskon. Mohon coba kirim ulang, sementara struk di voidkan. Error: {e}"
+
+        # Retrieve order details after adding products --- DIMATIKAN SEMENTARA UNTUK DEBUGGING
+        try:
+            order_details = fetch_order_details(order_id, access_token)
+
+        except Exception as e:
+            logger.error("Struk di voidkan karena kegagalan fetch detail order setelah tambah produk: %s", e)
+            update_status(order_id, "X", access_token)
+            return "Gagal mengambil detail order."
+
+        # Proses pembayaran --- DIMATIKAN SEMENTARA UNTUK DEBUGGING
         status = reconfirm_json.get('status', '').lower()
         if sudah_bayar or status == 'lunas':
             try:
@@ -897,7 +1073,7 @@ class AgentBabe:
                     # lanjutkan tanpa bayar atau return error?
                 else:
                     payment_id = payment_modes[idx]['id']
-                    # total_amount = int(float(order_details['data']['total_amount']))
+                    total_amount = int(float(order_details['data']['total_amount']))
                     update_payment(
                         order_id=order_id,
                         payment_amount=str(total_amount),
@@ -914,23 +1090,17 @@ class AgentBabe:
                 logger.error("Gagal proses pembayaran: %s", e)
                 # Tidak membatalkan order karena produk sudah masuk; tergantung kebijakan.
         
-        # 8. Cetak struk
+        # 8. Cetak struk --- DIMATIKAN SEMENTARA UNTUK DEBUGGING
         try:
             struk_url = cetak_struk(order_no, cust_telp)
         except Exception as e:
             logger.error("Gagal cetak struk: %s", e)
             struk_url = None
 
-        # 9. Buat invoice teks
+        # Catatan pending atau lunas
         pending_line = "*PENDING ORDER*\n" if status != 'lunas' else ""
 
-        # if reconfirm_json.get('jenis_pengiriman') == 'FD':
-        #     max_luncur = (datetime.now() + timedelta(minutes=35)).strftime('%H:%M')
-        # elif reconfirm_json.get('jenis_pengiriman') == 'I':
-        #     max_luncur = (datetime.now() + timedelta(minutes=25)).strftime('%H:%M')
-        # elif reconfirm_json.get('jenis_pengiriman') == 'EX':
-        #     max_luncur = (datetime.now() + timedelta(minutes=20)).strftime('%H:%M')
-
+        # Buat estimasi tiba
         try:
             max_luncur = estimasi_tiba(reconfirm_json['distance'], reconfirm_json['jenis_pengiriman'], datetime.now())
         except Exception as e:
@@ -948,11 +1118,11 @@ class AgentBabe:
             "",
             "",
             max_luncur_line.strip(),
-            f"Jarak: {reconfirm_json['distance']:.1f} km ({kelurahan}, {kecamatan.replace('Kecamatan ', '').replace('Kec. ', '').replace('kecamatan', '').replace('kec.', '')})",
+            f"Jarak: {reconfirm_json['distance']:.1f} km (*{kelurahan}, {kecamatan.replace('Kecamatan ', '').replace('Kec. ', '').replace('kecamatan', '').replace('kec.', '')}*)",
             "",
             "",
             "Makasih yaa Cah udah Jajan di Babe!",
-            f"Total Jajan: {total_ftotal}",
+            f"Total Jajan: {total_ftotal} (*{reconfirm_json.get('payment_type', '').upper()}*)",
             f"Cek Jajanmu di sini: {struk_url or 'Gagal mencetak struk. Tolong ulangi.'}",
             "",
             "",
@@ -961,6 +1131,8 @@ class AgentBabe:
         ]
         invoice = "\n".join([line for line in invoice_lines if line is not None])
         return invoice
+
+        # return cart_temp
     
     def add_discount(self, order_id, mode, access_token, discount=0, notes=""):
         ord_dtl = fetch_order_details(order_id, access_token)
