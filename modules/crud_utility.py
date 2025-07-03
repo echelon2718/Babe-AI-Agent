@@ -85,6 +85,7 @@ def create_order(
             "currency_id": "IDR",
             "customer_phone": nomor_telepon,
             "customer_name": nama_kastamer,
+            "customer_type_id": "195972",
             "notes": notes
         }
     
