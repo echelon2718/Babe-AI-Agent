@@ -1,5 +1,7 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 import time
 import requests
@@ -78,30 +80,109 @@ def address_to_latlng(address, api_key):
 #     address = data["results"][0]["formatted_address"]
 #     return address, (lat, lng)
 
+
+# def resolve_maps_shortlink(shortlink, api_key):
+#     """
+#     Resolve a Google Maps shortlink or share link to full address and components.
+
+#     Returns:
+#         address (str) or None,
+#         (lat, lng) tuple or (None, None),
+#         kelurahan, kecamatan, kota, provinsi or None each
+#     """
+#     # Try simple HTTP redirect resolution first
+#     try:
+#         resp = requests.get(shortlink, allow_redirects=True, timeout=10)
+#         final_url = resp.url
+#     except requests.RequestException:
+#         final_url = None
+
+#     # Fallback to headless browser if necessary
+#     if not final_url or ('maps' not in final_url):
+#         options = Options()
+#         options.add_argument("--headless=new")
+#         options.add_argument("--no-sandbox")
+#         options.add_argument("--disable-dev-shm-usage")
+#         options.add_argument("--disable-gpu")
+#         options.add_argument("--disable-software-rasterizer")
+#         options.add_argument("--remote-debugging-port=9222")
+#         options.add_argument("--user-data-dir=/tmp/selenium")
+
+#         driver = webdriver.Chrome(options=options)
+#         driver.get(shortlink)
+#         # Wait for URL to contain coordinates or map data
+#         WebDriverWait(driver, 10).until(
+#             lambda d: '/@' in d.current_url or '!3d' in d.current_url
+#         )
+#         final_url = driver.current_url
+#         driver.quit()
+
+#     # Patterns for coordinates in URL
+#     lat = lng = None
+#     # Pattern 1: /@lat,lng
+#     m = re.search(r'/@(-?\d+\.\d+),(-?\d+\.\d+)', final_url or '')
+#     if m:
+#         lat, lng = map(float, m.groups())
+#     else:
+#         # Pattern 2: !3dlat!4dlng
+#         m = re.search(r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)', final_url or '')
+#         if m:
+#             lat, lng = map(float, m.groups())
+
+#     if lat is None or lng is None:
+#         return None, (None, None), None, None, None, None
+
+#     # Reverse geocode
+#     endpoint = (
+#         f"https://maps.googleapis.com/maps/api/geocode/json"
+#         f"?latlng={lat},{lng}&key={api_key}"
+#     )
+#     try:
+#         geo = requests.get(endpoint).json()
+#         if geo.get("status") != "OK":
+#             return None, (lat, lng), None, None, None, None
+#         result = geo["results"][0]
+#     except requests.RequestException:
+#         return None, (lat, lng), None, None, None, None
+
+#     address = result.get("formatted_address")
+#     comps = result.get("address_components", [])
+#     kelurahan = kecamatan = kota = provinsi = None
+#     for comp in comps:
+#         types = comp.get("types", [])
+#         if "administrative_area_level_4" in types:
+#             kelurahan = comp.get("long_name")
+#         elif "administrative_area_level_3" in types:
+#             kecamatan = comp.get("long_name")
+#         elif "administrative_area_level_2" in types:
+#             kota = comp.get("long_name")
+#         elif "administrative_area_level_1" in types:
+#             provinsi = comp.get("long_name")
+
 def resolve_maps_shortlink(shortlink, api_key):
-    # Step 1: Buka browser headless
+    # Step 1: Buka browser headless dan resolve shortlink
     options = Options()
     options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+    # options.add_argument("--no-sandbox")
+    # options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--user-data-dir=/tmp/selenium")
+    # options.add_argument("--disable-software-rasterizer")
+    # options.add_argument("--remote-debugging-port=9222")
+    # options.add_argument("--user-data-dir=/tmp/selenium")
 
     driver = webdriver.Chrome(options=options)
     driver.get(shortlink)
-    time.sleep(5)
+    time.sleep(5)  # Tunggu redirect selesai
     final_url = driver.current_url
     driver.quit()
 
-    # Step 2: Koordinat
+    # Step 2: Ekstrak koordinat dari URL hasil redirect
     match = re.search(r'/@(-?\d+\.\d+),(-?\d+\.\d+)', final_url)
     if not match:
         return None, None, None, None, None, None
     lat, lng = map(float, match.groups())
 
-    # Step 3: Geocoding API
+    # Step 3: Ambil alamat dari koordinat via Geocoding API
     endpoint = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lng}&key={api_key}"
     response = requests.get(endpoint)
     data = response.json()
@@ -111,20 +192,20 @@ def resolve_maps_shortlink(shortlink, api_key):
 
     results = data["results"][0]
     address = results["formatted_address"]
-    components = results["address_components"]
 
+    # Step 4: Ekstrak kelurahan, kecamatan, kota, provinsi
     kelurahan = kecamatan = kota = provinsi = None
-
-    for component in components:
-        types = component["types"]
-        if "administrative_area_level_4" in types:
-            kelurahan = component["long_name"]
-        elif "administrative_area_level_3" in types:
-            kecamatan = component["long_name"]
-        elif "administrative_area_level_2" in types:
-            kota = component["long_name"]
-        elif "administrative_area_level_1" in types:
-            provinsi = component["long_name"]
+    for comp in results["address_components"]:
+        types = comp["types"]
+        if "administrative_area_level_4" in types or "sublocality_level_1" in types or "locality" in types:
+            if not kelurahan:
+                kelurahan = comp["long_name"]
+        if "administrative_area_level_3" in types:
+            kecamatan = comp["long_name"]
+        if "administrative_area_level_2" in types:
+            kota = comp["long_name"]
+        if "administrative_area_level_1" in types:
+            provinsi = comp["long_name"]
 
     return address, (lat, lng), kelurahan, kecamatan, kota, provinsi
 
@@ -165,6 +246,83 @@ def get_travel_distance(origin, destination, api_key, mode="driving"):
         "duration_seconds": duration_seconds
     }
 
+def get_fastest_route_details(origin, destination, api_key, mode="driving"):
+    """
+    Menemukan rute tercepat antara origin dan destination menggunakan Google Directions API,
+    dengan mempertimbangkan lalu lintas saat ini.
+
+    Args:
+        origin (tuple): Tuple koordinat (latitude, longitude) untuk titik awal.
+        destination (tuple): Tuple koordinat (latitude, longitude) untuk titik tujuan.
+        api_key (str): Kunci API Google Maps Anda.
+        mode (str, optional): Mode perjalanan. Pilihan: "driving", "walking", "bicycling", "transit". Defaultnya adalah "driving".
+
+    Returns:
+        dict: Sebuah dictionary berisi detail rute, atau None jika terjadi kesalahan.
+              Contoh:
+              {
+                  "distance_text": "20.3 km",
+                  "distance_meters": 20299,
+                  "duration_text": "35 mins",        // Durasi tanpa lalu lintas berat
+                  "duration_seconds": 2103,
+                  "duration_in_traffic_text": "45 mins", // Durasi dengan lalu lintas saat ini
+                  "duration_in_traffic_seconds": 2700
+              }
+    """
+    # Gunakan endpoint Directions API
+    base_url = "https://maps.googleapis.com/maps/api/directions/json"
+
+    params = {
+        "origin": f"{origin[0]},{origin[1]}",
+        "destination": f"{destination[0]},{destination[1]}",
+        "mode": mode,
+        "key": api_key,
+        # Kunci utama untuk rute tercepat: minta data berdasarkan waktu sekarang
+        # Ini akan mengaktifkan perhitungan berdasarkan lalu lintas real-time.
+        "departure_time": "now"
+    }
+
+    try:
+        response = requests.get(base_url, params=params)
+        response.raise_for_status()  # Akan memunculkan error jika status code bukan 2xx
+        data = response.json()
+
+        if data["status"] != "OK" or not data.get("routes"):
+            print(f"Error dari API: {data.get('status')}. Pesan: {data.get('error_message', 'Tidak ada rute ditemukan.')}")
+            return None
+
+        # Directions API mengembalikan daftar rute, rute pertama biasanya yang terbaik/direkomendasikan.
+        # Rute terdiri dari beberapa "leg" (segmen), untuk A->B hanya ada 1 leg.
+        leg = data["routes"][0]["legs"][0]
+
+        distance_text = leg["distance"]["text"]
+        distance_meters = leg["distance"]["value"]
+        
+        # Durasi standar (tanpa lalu lintas padat)
+        duration_text = leg["duration"]["text"]
+        duration_seconds = leg["duration"]["value"]
+        
+        # Durasi dengan lalu lintas saat ini (jika tersedia)
+        duration_in_traffic_text = leg.get("duration_in_traffic", {}).get("text", duration_text)
+        duration_in_traffic_seconds = leg.get("duration_in_traffic", {}).get("value", duration_seconds)
+
+
+        return {
+            "distance_text": distance_text,
+            "distance_meters": distance_meters,
+            "duration_text": duration_text,
+            "duration_seconds": duration_seconds,
+            "duration_in_traffic_text": duration_in_traffic_text,
+            "duration_in_traffic_seconds": duration_in_traffic_seconds
+        }
+
+    except requests.exceptions.RequestException as e:
+        print(f"Terjadi kesalahan saat melakukan request: {e}")
+        return None
+    except KeyError as e:
+        print(f"Gagal mem-parsing respons JSON, key tidak ditemukan: {e}")
+        return None
+
 def distance_cost_rule(dist: float, is_free: bool = False) -> str:
     if is_free and dist >= 9.5:
         return "Subsidi Ongkir 10K"
@@ -172,28 +330,28 @@ def distance_cost_rule(dist: float, is_free: bool = False) -> str:
     if dist < 9.5:
         return "Gratis Ongkir"
         
-    if dist >= 9.5 and dist <= 14.4:
+    if dist >= 9.5 and dist <= 13.9:
         return "Ongkir 10K"
     
-    elif dist > 14.4 and dist <= 19.4:
+    elif dist > 14 and dist <= 18.9:
         return "Ongkir 15K"
     
-    elif dist > 19.4 and dist <= 24.4:
+    elif dist > 18.9 and dist <= 23.9:
         return "Ongkir 20K"
     
-    elif dist > 24.4 and dist <= 29.4:
+    elif dist > 23.9 and dist <= 28.9:
         return "Ongkir 25K"
     
-    elif dist > 29.4 and dist <= 34.4:
+    elif dist > 28.9 and dist <= 33.9:
         return "Ongkir 30K"
     
-    elif dist > 34.4 and dist <= 39.4:
+    elif dist > 33.9 and dist <= 38.9:
         return "Ongkir 35K"
     
-    elif dist > 39.4 and dist <= 44.4:
+    elif dist > 38.9 and dist <= 43.9:
         return "Ongkir 40K"
     
-    elif dist > 44.4 and dist <= 45:
+    elif dist > 43.9 and dist <= 48.9:
         return "Ongkir 45K"
     
     else:
@@ -237,11 +395,11 @@ def estimasi_tiba(jarak_km: float, tipe: str, waktu_mulai: datetime) -> datetime
         instan = instan_malam
         express = express_malam
     else:
-        raise ValueError("Jam operasional hanya 11:00–19:00 (siang) atau 20:00–04:00 (malam)")
+        raise ValueError("Jam operasional hanya 11:00-19:00 (siang) atau 20:00-04:00 (malam)")
 
     # Hitung waktu tambahan
     if tipe == "FD":
-        waktu_tambah = timedelta(minutes=35 * ceil(jarak_km))
+        waktu_tambah = timedelta(minutes=35)
     elif tipe == "I":
         if km_index >= len(instan):
             raise ValueError("Jarak terlalu jauh untuk pengiriman Instan (maks 20 km)")
@@ -253,4 +411,4 @@ def estimasi_tiba(jarak_km: float, tipe: str, waktu_mulai: datetime) -> datetime
     else:
         raise ValueError("Tipe harus 'FD', 'I', atau 'EX'")
 
-    return waktu_mulai + waktu_tambah
+    return (waktu_mulai + waktu_tambah).strftime('%H:%M')
