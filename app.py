@@ -3,16 +3,16 @@ import json
 import os
 import pika
 from dotenv import load_dotenv
-from modules.llm_call import AgentBabe
+from modules.llm_call_new import AgentBabe
 import google.generativeai as genai
-pd.options.mode.chained_assignment = None  # default='warn'
+pd.options.mode.chained_assignment = None  
 
 load_dotenv()
 genai_api_key = os.getenv("GOOGLE_GENAI_API_KEY")
 gmap_api_key = os.getenv("GMAP_API_KEY")
 genai.configure(api_key=genai_api_key)
 
-# === Konfigurasi koneksi RabbitMQ ===
+
 agent = AgentBabe(df_combo_dir='./product_combos.csv', df_product_dir='./product_items.csv', top_k_retrieve=30, gmap_api_key=gmap_api_key)
 credentials = pika.PlainCredentials('guest', 'guest')
 parameters = pika.ConnectionParameters(
@@ -21,15 +21,15 @@ parameters = pika.ConnectionParameters(
     credentials=credentials
 )
 
-# === Koneksi dan channel ===
+
 connection = pika.BlockingConnection(parameters)
 channel = connection.channel()
 
-# === Pastikan kedua queue ada ===
+
 channel.queue_declare(queue='whatsapp_hook_queue', durable=True)
 channel.queue_declare(queue='whatsapp_message_queue', durable=True)
 
-# === Fungsi untuk membalas pesan ===
+
 def send_reply(from_number, to_number, order_body, mode="launch"):
     if mode == "launch":
         print(f"📥 Pesan diterima dari {to_number}: {order_body}")
@@ -39,8 +39,8 @@ def send_reply(from_number, to_number, order_body, mode="launch"):
 
     payload = {
         "command": "send_message",
-        "number": from_number,             # bot number
-        "number_recipient": to_number,     # user yang dikirimi pesan
+        "number": from_number,          
+        "number_recipient": to_number,  
         "message": response_message
     }
 
@@ -52,7 +52,7 @@ def send_reply(from_number, to_number, order_body, mode="launch"):
     )
     print(f"📤 Balasan dikirim ke {to_number}")
 
-# === Callback saat ada pesan masuk dari whatsapp_hook_queue ===
+
 def callback(ch, method, properties, body):
     try:
         payload = json.loads(body)
@@ -60,26 +60,33 @@ def callback(ch, method, properties, body):
         print(json.dumps(payload, indent=4))
 
         if payload.get("type") == "order":
-            from_number = "628123456789"  # nomor WA bot kamu
+            from_number = payload.get("sessionId")  
             to_number = payload.get("from")
             order_body = payload.get("body", "Pesanan tidak lengkap")
 
-            # Kirim balasan
+            
             send_reply(from_number, to_number, order_body)
 
+        
         ch.basic_ack(delivery_tag=method.delivery_tag)
+        print("✅ Pesan berhasil diproses dan di-acknowledge.")
 
     except Exception as e:
         print(f"❌ Error saat proses pesan: {e}")
+        
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 if __name__ == "__main__":
     try:
-        # === Jalankan listener ===
+        
+        
+        channel.basic_qos(prefetch_count=1)
+
+        
         channel.basic_consume(
             queue='whatsapp_hook_queue',
             on_message_callback=callback,
-            auto_ack=False
+            auto_ack=False 
         )
 
         print("🔄 Menunggu pesan dari 'whatsapp_hook_queue'...")
